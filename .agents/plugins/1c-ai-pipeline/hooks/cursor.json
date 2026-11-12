@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "node -e \"const p=require('node:path'),e=process.env,r=e.CURSOR_PLUGIN_ROOT||e.PLUGIN_ROOT||e.CLAUDE_PLUGIN_ROOT||e.CODEX_PLUGIN_ROOT||'.';require(p.join(r,'hooks','session-start.cjs')).runCli('cursor')\"",
+        "timeout": 5
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "node -e \"const p=require('node:path'),e=process.env,r=e.CURSOR_PLUGIN_ROOT||e.PLUGIN_ROOT||e.CLAUDE_PLUGIN_ROOT||e.CODEX_PLUGIN_ROOT||'.';require(p.join(r,'hooks','pre-tool-guard.cjs')).runCli('cursor')\"",
+        "timeout": 5
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "node -e \"const p=require('node:path'),e=process.env,r=e.CURSOR_PLUGIN_ROOT||e.PLUGIN_ROOT||e.CLAUDE_PLUGIN_ROOT||e.CODEX_PLUGIN_ROOT||'.';require(p.join(r,'hooks','post-tool-hygiene.cjs')).runCli('cursor')\"",
+        "timeout": 5
+      }
+    ]
+  }
+}

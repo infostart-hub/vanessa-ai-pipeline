@@ -1,0 +1,42 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "1c-ai-pipeline",
+  "version": "1.0.0",
+  "description": "Навыки, правила, защитные хуки и MCP-инструменты для анализа и развития решений на 1С: работа с требованиями, исходным кодом, метаданными, формами, отчётами, интеграциями, правами и сценариями тестирования.",
+  "author": {
+    "name": "infostart-hub",
+    "url": "https://github.com/infostart-hub"
+  },
+  "homepage": "https://github.com/infostart-hub/vanessa-ai-pipeline",
+  "repository": "https://github.com/infostart-hub/vanessa-ai-pipeline",
+  "keywords": [
+    "1c",
+    "bsl",
+    "edt",
+    "vanessa",
+    "mcp",
+    "skills",
+    "hooks"
+  ],
+  "extensions": {
+    "com.openai": {
+      "hooks": "./hooks/hooks.json",
+      "interface": {
+        "displayName": "1С · AI Pipeline",
+        "shortDescription": "Анализ, разработка и проверка решений на 1С",
+        "developerName": "infostart-hub",
+        "category": "Developer Tools",
+        "capabilities": [
+          "Interactive",
+          "Read",
+          "Write"
+        ],
+        "logo": "./assets/icon.svg",
+        "logoDark": "./assets/icon.svg"
+      }
+    },
+    "com.cursor": {
+      "hooks": "./hooks/cursor.json"
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "1c-ai-pipeline",
+  "interface": {
+    "displayName": "1С · AI Pipeline"
+  },
+  "plugins": [
+    {
+      "name": "1c-ai-pipeline",
+      "source": {
+        "source": "local",
+        "path": "./.agents/plugins/1c-ai-pipeline"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

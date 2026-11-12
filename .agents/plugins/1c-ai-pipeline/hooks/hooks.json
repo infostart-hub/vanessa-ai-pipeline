@@ -1,0 +1,39 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const p=require('node:path'),e=process.env,r=e.PLUGIN_ROOT||e.CLAUDE_PLUGIN_ROOT||e.CODEX_PLUGIN_ROOT||e.CURSOR_PLUGIN_ROOT||'.';require(p.join(r,'hooks','session-start.cjs')).runCli()\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const p=require('node:path'),e=process.env,r=e.PLUGIN_ROOT||e.CLAUDE_PLUGIN_ROOT||e.CODEX_PLUGIN_ROOT||e.CURSOR_PLUGIN_ROOT||'.';require(p.join(r,'hooks','pre-tool-guard.cjs')).runCli()\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const p=require('node:path'),e=process.env,r=e.PLUGIN_ROOT||e.CLAUDE_PLUGIN_ROOT||e.CODEX_PLUGIN_ROOT||e.CURSOR_PLUGIN_ROOT||'.';require(p.join(r,'hooks','post-tool-hygiene.cjs')).runCli()\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

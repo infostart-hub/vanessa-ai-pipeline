@@ -1,0 +1,11 @@
+# Публичный репозиторий единого плагина 1С · AI Pipeline (Agent Plugins 1.0).
+# Локальные рабочие клоны публичных форков лежат рядом и не входят в индекс этого репозитория.
+/edt-mcp/
+/vanessa-runner/
+/vanessa-automation/
+
+# Временные артефакты
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
