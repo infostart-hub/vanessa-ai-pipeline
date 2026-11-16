@@ -56,6 +56,12 @@ const OFFICIAL_EDT_DOWNLOAD = {
     'Дистрибутив 1C:EDT Start и 1С:EDT скачивается бесплатно с https://edt.1c.ru/ или https://releases.1c.ru/project/DevelopmentTools10 по обычной бесплатной учётной записи portal.1c.ru (платный договор ИТС для скачивания EDT не требуется). Через 1C:EDT Start установите 1С:EDT 2025.2, 2026.1 или 2026.2 (нужная Java с JavaFX ставится автоматически). Бесплатная комьюнити-лицензия разработчика 1С при необходимости оформляется на https://developer.1c.ru/.',
 };
 
+const ALLOWED_BROWSER_TARGETS = {
+  edt: OFFICIAL_EDT_DOWNLOAD.landingUrl,
+  releases: OFFICIAL_EDT_DOWNLOAD.releasesUrl,
+  license: OFFICIAL_EDT_DOWNLOAD.communityLicenseUrl,
+};
+
 function defaultSettingsPath(env = process.env, platform = process.platform, homedir = os.homedir()) {
   if (env.PLUGIN_DATA) {
     return path.join(env.PLUGIN_DATA, 'settings.json');
@@ -252,6 +258,154 @@ function fixWindowsUserPathForMise(shimsDir, options = {}) {
     return { changed: false, restartClientRequired: false };
   }
   return { changed: false, error: (res.stderr || out || 'failed to update User Path').trim() };
+}
+
+function resolveGitBinary(options = {}) {
+  const env = options.env || process.env;
+  const platform = options.platform || process.platform;
+  const probeFn = options.probeCommand || ((bin, args) => checkExecutableRuns(bin, args, { env, platform }));
+
+  const names = platform === 'win32' ? ['git.exe', 'git.cmd'] : ['git'];
+  const inPath = findInPath(names, env, platform);
+  const candidates = [];
+  if (inPath) candidates.push(inPath);
+  if (platform === 'win32') {
+    const pf = env.ProgramFiles || 'C:\\Program Files';
+    const pf86 = env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+    candidates.push(path.join(pf, 'Git', 'cmd', 'git.exe'));
+    candidates.push(path.join(pf86, 'Git', 'cmd', 'git.exe'));
+    if (env.LOCALAPPDATA) {
+      candidates.push(path.join(env.LOCALAPPDATA, 'Programs', 'Git', 'cmd', 'git.exe'));
+    }
+  } else {
+    candidates.push('/opt/homebrew/bin/git', '/usr/local/bin/git', '/usr/bin/git');
+  }
+  for (const cand of candidates) {
+    if (cand && isFile(cand)) {
+      const check = probeFn(cand, ['--version']);
+      if (check.ok) return cand;
+    }
+  }
+  return null;
+}
+
+function inspectGitIdentity(options = {}) {
+  const env = options.env || process.env;
+  const platform = options.platform || process.platform;
+  const gitBin = options.gitExecutable !== undefined ? options.gitExecutable : resolveGitBinary(options);
+  if (!gitBin) {
+    return {
+      gitInstalled: false,
+      gitExecutable: null,
+      userName: null,
+      userEmail: null,
+      configured: false,
+      promptQuestionRu:
+        'Как вас зовут (Имя и Фамилия) и какой у вас корпоративный e-mail? (Я сам настрою автора изменений для работы с конфигурацией 1С)',
+    };
+  }
+
+  const runGitCfg = (key) => {
+    const res = spawnSync(gitBin, ['config', '--global', '--get', key], {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 5000,
+      env,
+      shell: platform === 'win32' && /\.(cmd|bat)$/i.test(gitBin),
+    });
+    return res.status === 0 ? (res.stdout || '').trim() || null : null;
+  };
+
+  const userName = runGitCfg('user.name');
+  const userEmail = runGitCfg('user.email');
+  const configured = Boolean(userName && userEmail);
+
+  return {
+    gitInstalled: true,
+    gitExecutable: gitBin,
+    userName,
+    userEmail,
+    configured,
+    promptQuestionRu: configured
+      ? null
+      : 'Как вас зовут (Имя и Фамилия) и какой у вас корпоративный e-mail? (Я сам настрою автора изменений для работы с конфигурацией 1С)',
+  };
+}
+
+function configureGitIdentity(name, email, options = {}) {
+  const trimmedName = String(name || '').trim();
+  const trimmedEmail = String(email || '').trim();
+  if (!trimmedName) {
+    return { ok: false, error: 'Не указано имя (user.name).' };
+  }
+  if (!trimmedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
+    return { ok: false, error: 'Не указан корректный корпоративный e-mail (user.email).' };
+  }
+  const env = options.env || process.env;
+  const platform = options.platform || process.platform;
+  const gitBin = options.gitExecutable !== undefined ? options.gitExecutable : resolveGitBinary(options);
+  if (!gitBin) {
+    return { ok: false, error: 'Git не найден на компьютере. Сначала установите Git.' };
+  }
+  const execOpts = {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 5000,
+    env,
+    shell: platform === 'win32' && /\.(cmd|bat)$/i.test(gitBin),
+  };
+
+  const r1 = spawnSync(gitBin, ['config', '--global', 'user.name', trimmedName], execOpts);
+  const r2 = spawnSync(gitBin, ['config', '--global', 'user.email', trimmedEmail], execOpts);
+  // Keep Cyrillic 1C metadata filenames readable in git status / diff
+  spawnSync(gitBin, ['config', '--global', 'core.quotepath', 'false'], execOpts);
+
+  if (r1.status !== 0 || r2.status !== 0) {
+    return {
+      ok: false,
+      error: ((r1.stderr || '') + ' ' + (r2.stderr || '')).trim() || 'git config failed',
+    };
+  }
+  const verified = inspectGitIdentity({ ...options, gitExecutable: gitBin });
+  return { ok: verified.configured, ...verified };
+}
+
+function openUrlInSystemBrowser(targetKeyOrUrl = 'edt', options = {}) {
+  const resolvedUrl = ALLOWED_BROWSER_TARGETS[targetKeyOrUrl] || targetKeyOrUrl;
+  const allowedSet = new Set(Object.values(ALLOWED_BROWSER_TARGETS));
+  if (!allowedSet.has(resolvedUrl)) {
+    return {
+      ok: false,
+      url: resolvedUrl,
+      error: `URL is not in allowlist (${Array.from(allowedSet).join(', ')})`,
+    };
+  }
+  const platform = options.platform || process.platform;
+  if (typeof options.openBrowserFn === 'function') {
+    const custom = options.openBrowserFn(resolvedUrl, platform);
+    return { ok: Boolean(custom && custom.ok !== false), url: resolvedUrl, ...custom };
+  }
+  try {
+    let res;
+    if (platform === 'win32') {
+      res = spawnSync('rundll32.exe', ['url.dll,FileProtocolHandler', resolvedUrl], {
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 10000,
+      });
+    } else if (platform === 'darwin') {
+      res = spawnSync('open', [resolvedUrl], { encoding: 'utf8', timeout: 10000 });
+    } else {
+      res = spawnSync('xdg-open', [resolvedUrl], { encoding: 'utf8', timeout: 10000 });
+    }
+    return {
+      ok: res.status === 0,
+      url: resolvedUrl,
+      error: res.status === 0 ? null : ((res.stderr || res.stdout || `exit ${res.status}`).trim()),
+    };
+  } catch (error) {
+    return { ok: false, url: resolvedUrl, error: String(error.message || error) };
+  }
 }
 
 function discoverAiClients(options = {}) {
@@ -1033,6 +1187,7 @@ function inspectVanessaAutomation(settingsData = {}, options = {}) {
 
 async function runDoctor(options = {}) {
   const nodePath = inspectNodeAndPath(options);
+  const gitIdentity = inspectGitIdentity(options);
   const aiClients = discoverAiClients(options);
   const platforms = discoverPlatforms(options);
   const runnerDiag = diagnoseRunnerLauncher(options.settingsPath || null, options);
@@ -1053,6 +1208,7 @@ async function runDoctor(options = {}) {
 
   return {
     nodePath,
+    gitIdentity,
     aiClients,
     platforms,
     selectedPlatform: settingsData.v8version || (platforms[0] ? platforms[0].version : null),
@@ -1066,6 +1222,14 @@ async function runDoctor(options = {}) {
     },
     vanessaAutomation,
     edt: edtSubsystem,
+    humanChecklist: {
+      gitAuthorConfigured: gitIdentity.configured,
+      edtInstalled: Boolean(edtInfo.installed),
+      releaseEngineerRepoHintRu:
+        'Попросите у релиз-инженера доступ к репозиторию конфигурации 1С (КА / ЗУП / вашей базы) на вашу корпоративную почту и пришлите полученную ссылку в чат — ИИ сам скачает проект.',
+      manualTestDbLicenseHintRu:
+        'Откройте локальную тестовую копию базы (не боевую!) 1 раз вручную в «1С:Предприятии» и убедитесь, что она запускается без окна лицензии (при необходимости активируйте корп. пин-код или бесплатную комьюнити-лицензию с https://developer.1c.ru/).',
+    },
     onboardingModes: {
       directDatabaseModeReady: canWorkWithoutEdtNow,
       edtModeReady: canWorkWithEdtNow,
@@ -1468,6 +1632,7 @@ async function runDeploy(options = {}) {
   const repoRoot = findRepoCloneRoot(options);
   const platform = options.platform || process.platform;
   const miseBin = resolveMiseBinary(options);
+  const gitBin = resolveGitBinary(options) || 'git';
 
   // 1. Optional Windows User Path fix when global node is broken/missing
   const nodeStateBefore = inspectNodeAndPath(options);
@@ -1484,13 +1649,13 @@ async function runDeploy(options = {}) {
         steps.push({ step: `clone:${fork.dir}`, status: 'already_present', path: targetDir });
         continue;
       }
-      const cl = spawnSync('git', ['clone', fork.origin, targetDir], {
+      const cl = spawnSync(gitBin, ['clone', fork.origin, targetDir], {
         encoding: 'utf8',
         windowsHide: true,
         timeout: 300000,
       });
       if (cl.status === 0) {
-        spawnSync('git', ['-C', targetDir, 'remote', 'add', 'upstream', fork.upstream], {
+        spawnSync(gitBin, ['-C', targetDir, 'remote', 'add', 'upstream', fork.upstream], {
           encoding: 'utf8',
           windowsHide: true,
         });
@@ -1532,9 +1697,9 @@ async function runDeploy(options = {}) {
           const shellNeeded = platform === 'win32';
           spawnSync(opm, ['install', '--local', '--dev'], { cwd: runnerRoot, shell: shellNeeded, stdio: 'inherit', timeout: 300000 });
           spawnSync(opm, ['install', '--local', 'autumn-logos@1.3.3'], { cwd: runnerRoot, shell: shellNeeded, stdio: 'inherit', timeout: 120000 });
-          const checkPatch = spawnSync('git', ['apply', '--ignore-space-change', '--reverse', '--check', 'patches/autumn-mcp-discovery.patch'], { cwd: runnerRoot });
+          const checkPatch = spawnSync(gitBin, ['apply', '--ignore-space-change', '--reverse', '--check', 'patches/autumn-mcp-discovery.patch'], { cwd: runnerRoot });
           if (checkPatch.status !== 0) {
-            spawnSync('git', ['apply', '--ignore-space-change', 'patches/autumn-mcp-discovery.patch'], { cwd: runnerRoot });
+            spawnSync(gitBin, ['apply', '--ignore-space-change', 'patches/autumn-mcp-discovery.patch'], { cwd: runnerRoot });
           }
           steps.push({ step: 'vanessa_runner_setup', status: hasRunnerDependencies(runnerRoot) ? 'completed' : 'partial' });
         } else {
@@ -1557,6 +1722,9 @@ async function runDeploy(options = {}) {
   if (!options.skipEdt && edtInfo.installed && !edtInfo.pluginInstalled) {
     edtDeployResult = await deployEdtPlugin({ ...options, repoRoot });
     steps.push({ step: 'edt_mcp_deploy', ...edtDeployResult });
+  } else if (options.openEdtDownload && !edtInfo.installed) {
+    const browserRes = openUrlInSystemBrowser('edt', options);
+    steps.push({ step: 'open_edt_download_browser', ...browserRes });
   }
 
   const edtAfter = await diagnoseEdtSubsystem(discoverEdtInstallation(options), {}, options);
@@ -1642,7 +1810,16 @@ function formatHumanDoctorReport(report) {
     lines.push(`   Комьюнити-лицензия разработчика 1С: ${OFFICIAL_EDT_DOWNLOAD.communityLicenseUrl}`);
   }
 
-  lines.push(`6. Файл настроек: ${report.settingsFile}`);
+  if (report.gitIdentity) {
+    lines.push(
+      `6. Автор изменений (Git): ${
+        report.gitIdentity.configured
+          ? `НАСТРОЕН (${report.gitIdentity.userName} <${report.gitIdentity.userEmail}>)`
+          : 'НЕ ЗАПОЛНЕН — спросите у пользователя его Имя, Фамилию и корпоративный e-mail простым языком и выполните setup-git'
+      }`
+    );
+  }
+  lines.push(`7. Файл настроек: ${report.settingsFile}`);
   if (report.onboardingModes.directDatabaseModeReady && !report.onboardingModes.edtModeReady) {
     lines.push(
       '-> Статус старта: МОЖНО РАБОТАТЬ ПРЯМО СЕЙЧАС в режиме «Платформа 1С + Vanessa Runner» по тестовой копии базы (КА / ЗУП / ERP) без ожидания установки 1С:EDT.'
@@ -1660,6 +1837,7 @@ function parseCliArgs(argv) {
     subcommand,
     json: false,
     fixUserPath: false,
+    openEdtDownload: false,
     skipEdt: false,
     skipVa: false,
     rebuild: false,
@@ -1670,11 +1848,15 @@ function parseCliArgs(argv) {
     edtExe: null,
     port: null,
     repoRoot: null,
+    gitName: null,
+    gitEmail: null,
+    browserTarget: 'edt',
   };
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === '--json') flags.json = true;
     else if (arg === '--fix-user-path') flags.fixUserPath = true;
+    else if (arg === '--open-edt-download') flags.openEdtDownload = true;
     else if (arg === '--skip-edt') flags.skipEdt = true;
     else if (arg === '--skip-va') flags.skipVa = true;
     else if (arg === '--rebuild') flags.rebuild = true;
@@ -1685,6 +1867,10 @@ function parseCliArgs(argv) {
     else if (arg === '--edt-exe' && args[i + 1]) flags.edtExe = args[++i];
     else if (arg === '--port' && args[i + 1]) flags.port = Number(args[++i]);
     else if (arg === '--repo-root' && args[i + 1]) flags.repoRoot = args[++i];
+    else if (arg === '--name' && args[i + 1]) flags.gitName = args[++i];
+    else if (arg === '--email' && args[i + 1]) flags.gitEmail = args[++i];
+    else if (arg === '--target' && args[i + 1]) flags.browserTarget = args[++i];
+    else if (arg === '--license') flags.browserTarget = 'license';
   }
   return flags;
 }
@@ -1714,12 +1900,25 @@ async function main(argv = process.argv.slice(2)) {
     process.stdout.write(JSON.stringify(result, null, 2) + '\n');
     return result.ok ? 0 : 2;
   }
-  process.stderr.write(`Unknown subcommand: ${flags.subcommand}. Expected: doctor | deploy | deploy-edt\n`);
+  if (flags.subcommand === 'setup-git') {
+    const result = configureGitIdentity(flags.gitName, flags.gitEmail, flags);
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+    return result.ok ? 0 : 2;
+  }
+  if (flags.subcommand === 'open-edt-download') {
+    const result = openUrlInSystemBrowser(flags.browserTarget, flags);
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+    return result.ok ? 0 : 2;
+  }
+  process.stderr.write(
+    `Unknown subcommand: ${flags.subcommand}. Expected: doctor | deploy | deploy-edt | setup-git | open-edt-download\n`
+  );
   return 1;
 }
 
 module.exports = {
   OFFICIAL_EDT_DOWNLOAD,
+  ALLOWED_BROWSER_TARGETS,
   defaultSettingsPath,
   writeMergedSettings,
   findRepoCloneRoot,
@@ -1727,6 +1926,10 @@ module.exports = {
   getMiseShimsDir,
   inspectNodeAndPath,
   fixWindowsUserPathForMise,
+  resolveGitBinary,
+  inspectGitIdentity,
+  configureGitIdentity,
+  openUrlInSystemBrowser,
   discoverAiClients,
   discoverPlatforms,
   parseEdtIniVm,
