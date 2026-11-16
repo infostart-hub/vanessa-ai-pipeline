@@ -1155,100 +1155,187 @@ function extractZipArchive(zipFile, destDir, platform = process.platform) {
   return tar.status === 0;
 }
 
+function hasEdtMcpSourcesChangedSinceBuild(edtMcpDir, contentJarPath) {
+  if (!isFile(contentJarPath)) return true;
+  let buildMtimeMs = 0;
+  try {
+    buildMtimeMs = fs.statSync(contentJarPath).mtimeMs;
+  } catch {
+    return true;
+  }
+
+  // 1. Any modified/untracked source file in working tree newer than content.jar triggers rebuild
+  const statusRes = spawnSync('git', ['-C', edtMcpDir, 'status', '--porcelain'], {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 5000,
+  });
+  if (statusRes.status === 0 && statusRes.stdout.trim()) {
+    for (const rawLine of statusRes.stdout.split(/\r?\n/)) {
+      if (!rawLine || rawLine.length < 4) continue;
+      const rel = rawLine.slice(3).trim().replace(/^"|"$/g, '');
+      const full = path.join(edtMcpDir, rel);
+      try {
+        if (fs.existsSync(full) && fs.statSync(full).mtimeMs > buildMtimeMs) {
+          return true;
+        }
+      } catch {
+        return true;
+      }
+    }
+  }
+
+  // 2. If HEAD commit timestamp is newer than content.jar, rebuild
+  const logRes = spawnSync('git', ['-C', edtMcpDir, 'log', '-1', '--format=%ct'], {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 5000,
+  });
+  if (logRes.status === 0 && logRes.stdout.trim()) {
+    const headEpochMs = Number(logRes.stdout.trim()) * 1000;
+    if (Number.isFinite(headEpochMs) && headEpochMs > buildMtimeMs) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function downloadReleaseEdtP2(options = {}) {
+  const metaRaw = await httpsGetFollowRedirects(EDT_RELEASE_API_URL);
+  const release = JSON.parse(metaRaw.toString('utf8'));
+  const assets = Array.isArray(release.assets) ? release.assets : [];
+  const zipAsset = assets.find((a) => /^MCP-EDT\.v.*\.zip$/i.test(a.name));
+  const shaAsset = assets.find((a) => a.name === 'SHA256SUMS.txt');
+  if (!zipAsset || !zipAsset.browser_download_url) {
+    return {
+      ok: false,
+      reason: 'release_asset_missing',
+      detail: 'В GitHub Releases пока нет опубликованного архива MCP-EDT.v*.zip.',
+    };
+  }
+  const cacheBase = path.join(
+    path.dirname(defaultSettingsPath(options.env, options.platform, options.homedir)),
+    'edt-mcp-p2',
+    release.tag_name || 'latest'
+  );
+  const unpackedDir = path.join(cacheBase, 'repository');
+  if (
+    isDir(unpackedDir) &&
+    (isFile(path.join(unpackedDir, 'content.jar')) || isFile(path.join(unpackedDir, 'content.xml.xz')))
+  ) {
+    return { ok: true, source: 'release-cache', path: unpackedDir, tag: release.tag_name };
+  }
+  fs.mkdirSync(cacheBase, { recursive: true });
+  const zipPath = path.join(cacheBase, zipAsset.name);
+  const zipBytes = await httpsGetFollowRedirects(zipAsset.browser_download_url);
+  if (shaAsset && shaAsset.browser_download_url) {
+    const shaText = (await httpsGetFollowRedirects(shaAsset.browser_download_url)).toString('utf8');
+    const expectedLine = shaText.split(/\r?\n/).find((l) => l.includes(zipAsset.name));
+    if (expectedLine) {
+      const expectedHash = expectedLine.trim().split(/\s+/)[0].toLowerCase();
+      const actualHash = crypto.createHash('sha256').update(zipBytes).digest('hex').toLowerCase();
+      if (expectedHash !== actualHash) {
+        return { ok: false, reason: 'sha256_mismatch', detail: `SHA-256 mismatch for ${zipAsset.name}` };
+      }
+    }
+  }
+  fs.writeFileSync(zipPath, zipBytes);
+  if (extractZipArchive(zipPath, unpackedDir, options.platform || process.platform)) {
+    return { ok: true, source: 'github-release-fallback', path: unpackedDir, tag: release.tag_name };
+  }
+  return { ok: false, reason: 'zip_extract_failed', detail: `Не удалось распаковать ${zipPath}` };
+}
+
 async function resolveEdtP2Repository(options = {}) {
   if (options.p2Dir && isDir(options.p2Dir)) {
     return { ok: true, source: 'explicit', path: path.resolve(options.p2Dir) };
   }
-  const repoRoot = findRepoCloneRoot(options);
-  if (repoRoot) {
-    const localBuilt = path.join(
-      repoRoot,
-      'edt-mcp',
-      'mcp',
-      'repositories',
-      'com.ditrix.edt.mcp.server.repository',
-      'target',
-      'repository'
-    );
-    if (isDir(localBuilt) && isFile(path.join(localBuilt, 'content.jar'))) {
-      return { ok: true, source: 'local-build', path: localBuilt };
-    }
-  }
 
-  // Try official release artifact from infostart-hub/edt-mcp-aiadopted
-  if (!options.buildFromSource) {
+  // Extreme fallback ONLY when explicitly requested via --from-release
+  if (options.fromRelease) {
     try {
-      const metaRaw = await httpsGetFollowRedirects(EDT_RELEASE_API_URL);
-      const release = JSON.parse(metaRaw.toString('utf8'));
-      const assets = Array.isArray(release.assets) ? release.assets : [];
-      const zipAsset = assets.find((a) => /^MCP-EDT\.v.*\.zip$/i.test(a.name));
-      const shaAsset = assets.find((a) => a.name === 'SHA256SUMS.txt');
-      if (zipAsset && zipAsset.browser_download_url) {
-        const cacheBase = path.join(
-          path.dirname(defaultSettingsPath(options.env, options.platform, options.homedir)),
-          'edt-mcp-p2',
-          release.tag_name || 'latest'
-        );
-        const unpackedDir = path.join(cacheBase, 'repository');
-        if (isDir(unpackedDir) && (isFile(path.join(unpackedDir, 'content.jar')) || isFile(path.join(unpackedDir, 'content.xml.xz')))) {
-          return { ok: true, source: 'release-cache', path: unpackedDir, tag: release.tag_name };
-        }
-        fs.mkdirSync(cacheBase, { recursive: true });
-        const zipPath = path.join(cacheBase, zipAsset.name);
-        const zipBytes = await httpsGetFollowRedirects(zipAsset.browser_download_url);
-        if (shaAsset && shaAsset.browser_download_url) {
-          const shaText = (await httpsGetFollowRedirects(shaAsset.browser_download_url)).toString('utf8');
-          const expectedLine = shaText
-            .split(/\r?\n/)
-            .find((l) => l.includes(zipAsset.name));
-          if (expectedLine) {
-            const expectedHash = expectedLine.trim().split(/\s+/)[0].toLowerCase();
-            const actualHash = crypto.createHash('sha256').update(zipBytes).digest('hex').toLowerCase();
-            if (expectedHash !== actualHash) {
-              return { ok: false, reason: 'sha256_mismatch', detail: `SHA-256 mismatch for ${zipAsset.name}` };
-            }
-          }
-        }
-        fs.writeFileSync(zipPath, zipBytes);
-        if (extractZipArchive(zipPath, unpackedDir, options.platform || process.platform)) {
-          return { ok: true, source: 'github-release', path: unpackedDir, tag: release.tag_name };
-        }
-      }
-    } catch {
-      // Fall back to source build if available and requested
+      return await downloadReleaseEdtP2(options);
+    } catch (error) {
+      return {
+        ok: false,
+        reason: 'release_download_failed',
+        detail: `Не удалось скачать резервный релиз из GitHub Releases: ${error.message || error}`,
+      };
     }
   }
 
-  if (repoRoot && isDir(path.join(repoRoot, 'edt-mcp')) && options.buildFromSource) {
+  // Primary path: build directly from the local editable fork ./edt-mcp via mise
+  const repoRoot = findRepoCloneRoot(options);
+  const edtMcpDir = options.edtMcpDir || (repoRoot ? path.join(repoRoot, 'edt-mcp') : null);
+  if (!edtMcpDir || !isDir(edtMcpDir)) {
+    return {
+      ok: false,
+      reason: 'edt_mcp_clone_missing',
+      detail:
+        'Локальный клон ./edt-mcp не найден. Выполните `pipeline-deploy.cjs deploy` (или `mise run forks:clone`), чтобы работать с живыми исходниками форка. Флаг --from-release используйте только как крайний резервный вариант, если сборка на ПК невозможна.',
+    };
+  }
+
+  const localBuilt = path.join(
+    edtMcpDir,
+    'mcp',
+    'repositories',
+    'com.ditrix.edt.mcp.server.repository',
+    'target',
+    'repository'
+  );
+  const contentJar = path.join(localBuilt, 'content.jar');
+  const needsBuild =
+    Boolean(options.rebuild) ||
+    !isDir(localBuilt) ||
+    hasEdtMcpSourcesChangedSinceBuild(edtMcpDir, contentJar);
+
+  if (!needsBuild) {
+    return { ok: true, source: 'local-source-up-to-date', path: localBuilt };
+  }
+
+  const buildRunner = options.runSourceBuildFn || ((dir) => {
     const miseBin = resolveMiseBinary(options);
-    if (miseBin) {
-      const edtMcpDir = path.join(repoRoot, 'edt-mcp');
-      spawnSync(miseBin, ['trust'], { cwd: edtMcpDir, stdio: 'inherit', windowsHide: true });
-      const buildRes = spawnSync(miseBin, ['run', 'build'], {
-        cwd: edtMcpDir,
-        stdio: 'inherit',
-        windowsHide: true,
-        timeout: 900000,
-      });
-      const localBuilt = path.join(
-        edtMcpDir,
-        'mcp',
-        'repositories',
-        'com.ditrix.edt.mcp.server.repository',
-        'target',
-        'repository'
-      );
-      if (buildRes.status === 0 && isDir(localBuilt)) {
-        return { ok: true, source: 'built-from-source', path: localBuilt };
-      }
+    if (!miseBin) {
+      return {
+        ok: false,
+        detail: 'Не найден mise для локальной сборки ./edt-mcp (JDK 25 + Maven 3.9). Установите mise.',
+      };
     }
+    spawnSync(miseBin, ['trust'], { cwd: dir, stdio: 'inherit', windowsHide: true });
+    const installRes = spawnSync(miseBin, ['install'], {
+      cwd: dir,
+      stdio: 'inherit',
+      windowsHide: true,
+      timeout: 600000,
+    });
+    if (installRes.status !== 0) {
+      return { ok: false, detail: `mise install в ${dir} завершился с кодом ${installRes.status}` };
+    }
+    const buildRes = spawnSync(miseBin, ['run', 'build'], {
+      cwd: dir,
+      stdio: 'inherit',
+      windowsHide: true,
+      timeout: 900000,
+    });
+    if (buildRes.status !== 0) {
+      return { ok: false, detail: `mise run build в ${dir} завершился с кодом ${buildRes.status}` };
+    }
+    return { ok: true };
+  });
+
+  const buildOutcome = buildRunner(edtMcpDir);
+  if (buildOutcome.ok && isDir(localBuilt)) {
+    return { ok: true, source: 'built-from-local-source', path: localBuilt };
   }
 
   return {
     ok: false,
-    reason: 'p2_repository_unavailable',
+    reason: 'local_source_build_failed',
     detail:
-      'Готовый p2-архив ещё не найден в GitHub Releases и локально не собран. Для локальной сборки запустите с флагом --build-from-source (потребуется mise с JDK 25 и Maven).',
+      `${buildOutcome.detail || 'Сборка локального форка ./edt-mcp не удалась.'} ` +
+      'Разберите ошибку сборки в ./edt-mcp (это штатный путь, позволяющий агенту патчить EDT MCP под задачи). ' +
+      'Только если на этом ПК корпоративная сеть полностью блокирует Maven, используйте крайний резервный флаг --from-release.',
   };
 }
 
@@ -1575,7 +1662,8 @@ function parseCliArgs(argv) {
     fixUserPath: false,
     skipEdt: false,
     skipVa: false,
-    buildFromSource: false,
+    rebuild: false,
+    fromRelease: false,
     probeMcp: true,
     settingsPath: null,
     p2Dir: null,
@@ -1589,7 +1677,8 @@ function parseCliArgs(argv) {
     else if (arg === '--fix-user-path') flags.fixUserPath = true;
     else if (arg === '--skip-edt') flags.skipEdt = true;
     else if (arg === '--skip-va') flags.skipVa = true;
-    else if (arg === '--build-from-source') flags.buildFromSource = true;
+    else if (arg === '--rebuild') flags.rebuild = true;
+    else if (arg === '--from-release') flags.fromRelease = true;
     else if (arg === '--no-mcp-probe') flags.probeMcp = false;
     else if (arg === '--settings' && args[i + 1]) flags.settingsPath = args[++i];
     else if (arg === '--p2-dir' && args[i + 1]) flags.p2Dir = args[++i];
@@ -1649,6 +1738,8 @@ module.exports = {
   diagnoseEdtSubsystem,
   inspectVanessaAutomation,
   runDoctor,
+  hasEdtMcpSourcesChangedSinceBuild,
+  resolveEdtP2Repository,
   deployEdtPlugin,
   runDeploy,
   formatHumanDoctorReport,
