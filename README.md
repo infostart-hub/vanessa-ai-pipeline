@@ -16,7 +16,7 @@
 
 Пакет расположен в [`.agents/plugins/1c-ai-pipeline`](.agents/plugins/1c-ai-pipeline) и объединяет четыре взаимодополняющих уровня в одной карточке плагина:
 
-1. **Предметный уровень (`onec-*`, 30 навыков)** — методология и учётные инварианты 1С: требования и Fit/Gap, расширения и режимы совместимости, управляемые и обычные формы, асинхронный клиентский код, составление запросов и СКД, роли и RLS, транзакции и управляемые блокировки, Хранилище конфигурации 1С, КД 2 / КД 3 (`EnterpriseData`), интеграции/OData/XDTO, ЭДО/МЧД/Честный ЗНАК/ЕГАИС, печатные формы MXL, БСП, подписки и фоновые задания, техжурнал, ревью кода, диагностика движений КА/ERP и начислений ЗУП, модульные и сценарные тесты.
+1. **Предметный уровень (`onec-*`, 31 навык)** — методология, онбординг стенда (`onec-setup-and-connect`) и учётные инварианты 1С: требования и Fit/Gap, расширения и режимы совместимости, управляемые и обычные формы, асинхронный клиентский код, составление запросов и СКД, роли и RLS, транзакции и управляемые блокировки, Хранилище конфигурации 1С, КД 2 / КД 3 (`EnterpriseData`), интеграции/OData/XDTO, ЭДО/МЧД/Честный ЗНАК/ЕГАИС, печатные формы MXL, БСП, подписки и фоновые задания, техжурнал, ревью кода, диагностика движений КА/ERP и начислений ЗУП, модульные и сценарные тесты.
 2. **Инструментальный уровень EDT (`edt-mcp-project-*`, 13 навыков)** — протоколы безопасного чтения, навигации, точечной правки BSL/метаданных/форм/СКД, профилирования, отладки и запуска YAxUnit через MCP-сервер 1С:EDT.
 3. **Уровень исполнения в ИБ (`vanessa-runner`, 1 навык)** — управляемая инициализация баз, проверка синтаксиса, запуск клиента 1С и автономный прогон BDD-сценариев Vanessa Automation с JUnit/Allure-отчётами.
 4. **Защитные хуки (`hooks/`, 3 события жизненного цикла)** — кроссплатформенные перехватчики для OpenAI Codex, Claude Code и Cursor:
@@ -48,12 +48,14 @@
   curl -fsSL https://mise.run | sh
   ```
 
-После установки `mise` в корне клона достаточно выполнить:
+После установки `mise` в корне клона доступны задачи развёртывания и самодиагностики:
 
 ```sh
 mise trust
 mise install
-mise run check
+mise run deploy   # клонирование форков, настройка Vanessa Runner / EDT MCP и запись settings.json
+mise run doctor   # полная диагностика Node/PATH, Платформы 1С, Vanessa Runner, 1С:EDT и портов MCP
+mise run check    # проверка манифестов, защитных хуков и запускателя
 ```
 
 ## Публичные репозитории поставки (`infostart-hub`)
@@ -81,7 +83,11 @@ mise run forks:clone
 http://127.0.0.1:8765/mcp
 ```
 
-Установите плагин **EDT MCP Server** (из [`edt-mcp-aiadopted`](https://github.com/infostart-hub/edt-mcp-aiadopted), см. `SETUP.md`) в 1С:EDT, откройте нужный проект конфигурации/расширения и убедитесь, что встроенный сервер запущен на порту `8765` (либо скорректируйте порт в настройках EDT / пользовательском переопределении MCP-клиента).
+Установите плагин **EDT MCP Server** (автоматически командой `node .agents/plugins/1c-ai-pipeline/bin/pipeline-deploy.cjs deploy-edt` при закрытой 1С:EDT либо вручную из [`edt-mcp-aiadopted`](https://github.com/infostart-hub/edt-mcp-aiadopted), см. `SETUP.md`), откройте нужный проект конфигурации/расширения и убедитесь, что встроенный сервер запущен на порту `8765` (если `8765` занят посторонним локальным процессом, `pipeline-deploy.cjs` автоматически подберёт свободный порт, например `8766`).
+
+Если **1С:EDT** на компьютере ещё не установлена:
+- официальный установщик **1C:EDT Start** и дистрибутивы **1С:EDT** (`2025.2` / `2026.1` / `2026.2`) скачиваются **бесплатно** с [`https://edt.1c.ru/`](https://edt.1c.ru/) или [`https://releases.1c.ru/project/DevelopmentTools10`](https://releases.1c.ru/project/DevelopmentTools10) по обычной бесплатной учётной записи `portal.1c.ru` (платный договор ИТС для скачивания EDT не нужен; комьюнити-лицензия разработчика при необходимости оформляется на [`https://developer.1c.ru/`](https://developer.1c.ru/));
+- ждать установки 1С:EDT для старта не обязательно — при наличии платформы 1С и `Vanessa Runner` можно сразу работать с тестовой копией базы (КА / ЗУП / ERP) напрямую.
 
 ### 2. MCP-сервер `vanessa-runner` (OneScript + платформа 1С)
 
@@ -129,9 +135,9 @@ node .agents/plugins/1c-ai-pipeline/bin/vanessa-runner-mcp.cjs --check
 - **`MaxVMarkov/1c-debug-mcp`** — прямое подключение к серверу отладки кластера 1С (`dbgs` / RDBG);
 - **`Romandredan/odata1c-gate`** — чтение тестовой копии ИБ по OData с локальной псевдонимизацией ИНН, телефонов, ФИО и счетов.
 
-## Каталог навыков (44)
+## Каталог навыков (45)
 
-- **Анализ, архитектура, хранилище и поставка**: `onec-requirements-analysis`, `onec-configuration-overview`, `onec-change-impact`, `onec-extension-change`, `onec-configuration-repository`, `onec-external-processors-and-delivery`, `onec-code-review-and-standards`.
+- **Развёртывание стенда, анализ, архитектура, хранилище и поставка**: `onec-setup-and-connect`, `onec-requirements-analysis`, `onec-configuration-overview`, `onec-change-impact`, `onec-extension-change`, `onec-configuration-repository`, `onec-external-processors-and-delivery`, `onec-code-review-and-standards`.
 - **Объекты, формы, запросы, отчёты, печать и БСП**: `onec-object-lifecycle`, `onec-managed-form-design`, `onec-query-composition`, `onec-dcs-design`, `onec-print-forms-and-mxl`, `onec-bsp-api`, `onec-event-subscriptions-and-jobs`.
 - **Надёжность, права, конвертация, интеграции и регуляторика РФ**: `onec-transactions-and-locks`, `onec-access-and-roles`, `onec-data-conversion-kd`, `onec-integration-and-exchange`, `onec-xdto-import`, `onec-regulatory-edo-marking`, `onec-performance-and-cluster`, `onec-techlog-and-diagnostics`.
 - **Учётная диагностика и смежные технологии**: `onec-movement-diagnosis`, `onec-ka-incident-router`, `onec-zup-payroll-diagnostics`, `onec-onescript-and-autumn`, `onec-element-development`.

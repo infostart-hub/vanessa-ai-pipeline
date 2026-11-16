@@ -22,17 +22,42 @@ function isDir(candidate) {
   }
 }
 
-function readSettings(explicitPath) {
+function parseSemverTuple(text) {
+  const match = String(text || '').match(/(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?/);
+  if (!match) return null;
+  return [
+    Number(match[1]),
+    Number(match[2]),
+    Number(match[3]),
+    match[4] !== undefined ? Number(match[4]) : -1,
+  ];
+}
+
+function compareSemverDesc(a, b) {
+  const va = parseSemverTuple(a);
+  const vb = parseSemverTuple(b);
+  if (va && vb) {
+    for (let i = 0; i < 4; i += 1) {
+      if (va[i] !== vb[i]) return vb[i] - va[i];
+    }
+  } else if (va) {
+    return -1;
+  } else if (vb) {
+    return 1;
+  }
+  return String(b).localeCompare(String(a));
+}
+
+function readSettings(explicitPath, env = process.env, platform = process.platform, homedir = os.homedir()) {
   const candidates = [];
   if (explicitPath) candidates.push(explicitPath);
-  if (process.env.PLUGIN_DATA) {
-    candidates.push(path.join(process.env.PLUGIN_DATA, 'settings.json'));
+  if (env.PLUGIN_DATA) {
+    candidates.push(path.join(env.PLUGIN_DATA, 'settings.json'));
   }
-  const home = os.homedir();
-  if (process.platform === 'win32' && process.env.APPDATA) {
-    candidates.push(path.join(process.env.APPDATA, '1c-ai-pipeline', 'settings.json'));
-  } else if (home) {
-    candidates.push(path.join(home, '.config', '1c-ai-pipeline', 'settings.json'));
+  if (platform === 'win32' && env.APPDATA) {
+    candidates.push(path.join(env.APPDATA, '1c-ai-pipeline', 'settings.json'));
+  } else if (homedir) {
+    candidates.push(path.join(homedir, '.config', '1c-ai-pipeline', 'settings.json'));
   }
   for (const file of candidates) {
     if (!isFile(file)) continue;
@@ -49,9 +74,13 @@ function readSettings(explicitPath) {
   return { source: null, data: {} };
 }
 
-function findInPath(names) {
-  const pathEnv = process.env.PATH || '';
-  const dirs = pathEnv.split(path.delimiter).filter(Boolean);
+function findInPath(names, env = process.env, platform = process.platform) {
+  const pathEnv = env.PATH || env.Path || '';
+  const delim = platform === 'win32' ? ';' : path.delimiter;
+  const dirs = pathEnv
+    .split(delim)
+    .map((part) => part.trim().replace(/^"|"$/g, ''))
+    .filter(Boolean);
   for (const dir of dirs) {
     for (const name of names) {
       const full = path.join(dir, name);
@@ -67,8 +96,7 @@ function listSubdirMatches(parentDir, prefix, relativeBinary) {
     return fs
       .readdirSync(parentDir)
       .filter((entry) => !prefix || entry.startsWith(prefix))
-      .sort()
-      .reverse()
+      .sort(compareSemverDesc)
       .map((entry) => path.join(parentDir, entry, relativeBinary))
       .filter(isFile);
   } catch {
@@ -76,66 +104,113 @@ function listSubdirMatches(parentDir, prefix, relativeBinary) {
   }
 }
 
-function resolveOscript(settingsOscript) {
+function resolveOscript(settingsOscript, options = {}) {
+  const env = options.env || process.env;
+  const platform = options.platform || process.platform;
+  const home = options.homedir !== undefined ? options.homedir : os.homedir();
+
   if (typeof settingsOscript === 'string' && isFile(settingsOscript)) {
     return path.resolve(settingsOscript);
   }
-  if (process.env.OSCRIPT_BIN && isFile(process.env.OSCRIPT_BIN)) {
-    return path.resolve(process.env.OSCRIPT_BIN);
+  if (env.OSCRIPT_BIN && isFile(env.OSCRIPT_BIN)) {
+    return path.resolve(env.OSCRIPT_BIN);
   }
-  const binNames = process.platform === 'win32'
+  if (env.OVM_OSCRIPTBIN) {
+    const ovmBinExe = path.join(env.OVM_OSCRIPTBIN, platform === 'win32' ? 'oscript.exe' : 'oscript');
+    if (isFile(ovmBinExe)) return path.resolve(ovmBinExe);
+  }
+
+  const binNames = platform === 'win32'
     ? ['oscript.exe', 'oscript.bat', 'oscript.cmd']
     : ['oscript'];
-  const fromPath = findInPath(binNames);
+  const fromPath = findInPath(binNames, env, platform);
   if (fromPath) return fromPath;
 
-  const home = os.homedir();
-  const exe = process.platform === 'win32' ? 'oscript.exe' : 'oscript';
-  if (home) {
-    const infostartMatches = listSubdirMatches(
-      path.join(home, '.local', 'share', 'infostart-tools'),
-      'onescript-',
-      path.join('bin', exe)
-    );
-    if (infostartMatches.length > 0) return infostartMatches[0];
+  const exe = platform === 'win32' ? 'oscript.exe' : 'oscript';
+  const binRel = path.join('bin', exe);
 
-    const ovmUnix = path.join(home, '.local', 'share', 'ovm', 'current', 'bin', exe);
-    if (isFile(ovmUnix)) return ovmUnix;
-    const ovmVersions = listSubdirMatches(
-      path.join(home, '.local', 'share', 'ovm', 'versions'),
-      '',
-      path.join('bin', exe)
-    );
-    if (ovmVersions.length > 0) return ovmVersions[0];
-  }
-  if (process.platform === 'win32') {
-    const localAppData = process.env.LOCALAPPDATA;
-    if (localAppData) {
-      const ovmWin = path.join(localAppData, 'ovm', 'current', 'bin', 'oscript.exe');
-      if (isFile(ovmWin)) return ovmWin;
+  if (platform === 'win32') {
+    const winRoots = [];
+    if (env.LOCALAPPDATA) winRoots.push(path.join(env.LOCALAPPDATA, 'ovm'));
+    if (env.USERPROFILE) {
+      winRoots.push(path.join(env.USERPROFILE, 'AppData', 'Local', 'ovm'));
+      winRoots.push(path.join(env.USERPROFILE, '.local', 'share', 'ovm'));
     }
-    const progFiles = process.env.ProgramFiles || 'C:\\Program Files';
-    const stdWin = path.join(progFiles, 'OneScript', 'bin', 'oscript.exe');
-    if (isFile(stdWin)) return stdWin;
+    if (home) {
+      winRoots.push(path.join(home, 'AppData', 'Local', 'ovm'));
+      winRoots.push(path.join(home, '.local', 'share', 'ovm'));
+    }
+
+    for (const ovmRoot of winRoots) {
+      for (const alias of ['current', 'stable']) {
+        const aliasExe = path.join(ovmRoot, alias, binRel);
+        if (isFile(aliasExe)) return aliasExe;
+      }
+      const inVersions = listSubdirMatches(path.join(ovmRoot, 'versions'), '', binRel);
+      if (inVersions.length > 0) return inVersions[0];
+
+      // On Windows, `ovm install 2.2.1` places versions directly in `%LOCALAPPDATA%\ovm\2.2.1\bin\oscript.exe`
+      const directVersions = listSubdirMatches(ovmRoot, '', binRel).filter((candidate) => {
+        const folder = path.basename(path.dirname(path.dirname(candidate)));
+        return Boolean(parseSemverTuple(folder));
+      });
+      if (directVersions.length > 0) return directVersions[0];
+    }
+
+    const progFilesCandidates = [
+      env.ProgramFiles || 'C:\\Program Files',
+      env['ProgramFiles(x86)'],
+    ].filter(Boolean);
+    for (const progRoot of progFilesCandidates) {
+      const stdWin = path.join(progRoot, 'OneScript', 'bin', 'oscript.exe');
+      if (isFile(stdWin)) return stdWin;
+    }
   } else {
-    for (const candidate of ['/usr/local/bin/oscript', '/opt/onescript/bin/oscript']) {
+    if (home) {
+      const infostartMatches = listSubdirMatches(
+        path.join(home, '.local', 'share', 'infostart-tools'),
+        'onescript-',
+        binRel
+      );
+      if (infostartMatches.length > 0) return infostartMatches[0];
+
+      const ovmRoot = path.join(home, '.local', 'share', 'ovm');
+      for (const alias of ['current', 'stable']) {
+        const ovmAlias = path.join(ovmRoot, alias, binRel);
+        if (isFile(ovmAlias)) return ovmAlias;
+      }
+      const ovmVersions = listSubdirMatches(path.join(ovmRoot, 'versions'), '', binRel);
+      if (ovmVersions.length > 0) return ovmVersions[0];
+
+      const ovmDirect = listSubdirMatches(ovmRoot, '', binRel).filter((candidate) => {
+        const folder = path.basename(path.dirname(path.dirname(candidate)));
+        return Boolean(parseSemverTuple(folder));
+      });
+      if (ovmDirect.length > 0) return ovmDirect[0];
+    }
+
+    for (const candidate of ['/usr/local/bin/oscript', '/opt/onescript/bin/oscript', '/usr/bin/oscript']) {
       if (isFile(candidate)) return candidate;
     }
   }
   return null;
 }
 
-function resolveRunnerRoot(settingsRunnerRoot) {
+function resolveRunnerRoot(settingsRunnerRoot, options = {}) {
+  const env = options.env || process.env;
+  const cwd = options.cwd || process.cwd();
+  const home = options.homedir !== undefined ? options.homedir : os.homedir();
+
   const candidates = [];
   if (typeof settingsRunnerRoot === 'string') candidates.push(settingsRunnerRoot);
-  if (process.env.VANESSA_RUNNER_ROOT) candidates.push(process.env.VANESSA_RUNNER_ROOT);
+  if (env.VANESSA_RUNNER_ROOT) candidates.push(env.VANESSA_RUNNER_ROOT);
 
-  const pluginRoot = process.env.PLUGIN_ROOT || path.resolve(__dirname, '..');
+  const pluginRoot = env.PLUGIN_ROOT || path.resolve(__dirname, '..');
   // Sibling checkout beside repository root when running from <repo>/.agents/plugins/1c-ai-pipeline
   candidates.push(path.resolve(pluginRoot, '..', '..', '..', 'vanessa-runner'));
 
   // Walk up from current working directory to discover an explicit or sibling vanessa-runner checkout
-  let cursor = process.cwd();
+  let cursor = cwd;
   for (let depth = 0; depth < 5; depth += 1) {
     candidates.push(cursor);
     candidates.push(path.join(cursor, 'vanessa-runner'));
@@ -144,8 +219,8 @@ function resolveRunnerRoot(settingsRunnerRoot) {
     cursor = parent;
   }
 
-  const home = os.homedir();
   if (home) {
+    candidates.push(path.join(home, 'tools', 'vanessa-ai-pipeline', 'vanessa-runner'));
     candidates.push(path.join(home, '.local', 'share', 'vanessa-runner'));
     candidates.push(path.join(home, 'vanessa-runner'));
   }
@@ -195,23 +270,28 @@ function buildChildEnv(baseEnv = process.env, targetPlatform = process.platform)
   return env;
 }
 
-function diagnose(explicitSettingsPath) {
+function diagnose(explicitSettingsPath, options = {}) {
   const checks = [];
-  const settingsInfo = readSettings(explicitSettingsPath);
+  const settingsInfo = readSettings(
+    explicitSettingsPath,
+    options.env,
+    options.platform,
+    options.homedir
+  );
   if (settingsInfo.error) {
     checks.push({ requirement: 'settings', ok: false, detail: settingsInfo.error });
   } else if (settingsInfo.source) {
     checks.push({ requirement: 'settings', ok: true, detail: settingsInfo.source });
   }
 
-  const oscript = resolveOscript(settingsInfo.data.oscript);
+  const oscript = resolveOscript(settingsInfo.data.oscript, options);
   checks.push({
     requirement: 'oscript',
     ok: Boolean(oscript),
-    detail: oscript || 'OneScript executable (oscript) not found; set OSCRIPT_BIN or add oscript to PATH',
+    detail: oscript || 'OneScript executable (oscript) not found; set OSCRIPT_BIN, settings.json "oscript", or install via ovm',
   });
 
-  const runnerRoot = resolveRunnerRoot(settingsInfo.data.runner_root);
+  const runnerRoot = resolveRunnerRoot(settingsInfo.data.runner_root, options);
   checks.push({
     requirement: 'runner_root',
     ok: Boolean(runnerRoot),
@@ -232,10 +312,10 @@ function diagnose(explicitSettingsPath) {
     ok: depsOk,
     detail: depsOk
       ? path.join(runnerRoot, 'oscript_modules', 'autumn-mcp')
-      : 'oscript_modules/autumn-mcp is missing inside runner_root; run "opm install -l" in vanessa-runner',
+      : 'oscript_modules/autumn-mcp is missing inside runner_root; run "mise run setup" or "opm install -l" in vanessa-runner',
   });
 
-  return { checks, oscript, runnerRoot, entry };
+  return { checks, oscript, runnerRoot, entry, settingsInfo };
 }
 
 function runServer(oscript, entry, runnerRoot) {
@@ -296,7 +376,13 @@ function main(argv = process.argv.slice(2)) {
 }
 
 module.exports = {
+  isFile,
+  isDir,
+  parseSemverTuple,
+  compareSemverDesc,
   readSettings,
+  findInPath,
+  listSubdirMatches,
   resolveOscript,
   resolveRunnerRoot,
   hasRunnerDependencies,

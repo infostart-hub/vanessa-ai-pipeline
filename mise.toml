@@ -8,6 +8,18 @@ run = [
   "node -e \"const cp=require('node:child_process');const r=cp.spawnSync(process.execPath,['.agents/plugins/1c-ai-pipeline/bin/vanessa-runner-mcp.cjs','--check'],{stdio:'inherit'});if(r.status!==0&&r.status!==2)process.exit(r.status??1);\"",
 ]
 
+[tasks.doctor]
+description = "Полная диагностика стенда (Node/PATH, Платформа 1С, Vanessa Runner, Vanessa Automation, 1С:EDT и порты MCP)"
+run = "node .agents/plugins/1c-ai-pipeline/bin/pipeline-deploy.cjs doctor"
+
+[tasks.deploy]
+description = "Клонировать форки, настроить окружение Vanessa Runner / EDT MCP и сохранить settings.json"
+run = "node .agents/plugins/1c-ai-pipeline/bin/pipeline-deploy.cjs deploy"
+
+[tasks."deploy:edt"]
+description = "Установить или обновить плагин EDT MCP в найденной 1С:EDT"
+run = "node .agents/plugins/1c-ai-pipeline/bin/pipeline-deploy.cjs deploy-edt"
+
 [tasks."forks:clone"]
 description = "Клонировать сопутствующие публичные форки (edt-mcp, vanessa-runner, vanessa-automation) в gitignored-каталоги"
 run = "node -e \"const cp=require('node:child_process'),fs=require('node:fs');for(const [d,o,u] of [['edt-mcp','https://github.com/infostart-hub/edt-mcp-aiadopted.git','https://github.com/DitriXNew/EDT-MCP.git'],['vanessa-runner','https://github.com/infostart-hub/vanessa-runner-aiadopted.git','https://github.com/vanessa-opensource/vanessa-runner.git'],['vanessa-automation','https://github.com/infostart-hub/vanessa-automation-aiadopted.git','https://github.com/Pr-Mex/vanessa-automation.git']]){if(fs.existsSync(d+'/.git')){console.log('skip existing:',d);continue;}const c=cp.spawnSync('git',['clone',o,d],{stdio:'inherit'});if(c.status!==0)process.exit(c.status??1);cp.spawnSync('git',['-C',d,'remote','add','upstream',u],{stdio:'inherit'});}\""
