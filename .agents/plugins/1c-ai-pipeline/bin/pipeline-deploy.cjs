@@ -289,6 +289,61 @@ function resolveGitBinary(options = {}) {
   return null;
 }
 
+function ensureGitOnWindows(options = {}) {
+  const existing = resolveGitBinary(options);
+  if (existing) {
+    return { ok: true, status: 'already_present', executable: existing };
+  }
+  const platform = options.platform || process.platform;
+  if (platform !== 'win32' || options.autoInstallGit === false) {
+    return { ok: false, status: 'missing', executable: null };
+  }
+  const installerFn = options.installGitFn || (() => {
+    return spawnSync(
+      'winget',
+      ['install', '--id', 'Git.Git', '-e', '--accept-source-agreements', '--accept-package-agreements', '--silent'],
+      { encoding: 'utf8', windowsHide: true, timeout: 300000 }
+    );
+  });
+  try {
+    const installRes = installerFn();
+    const afterBin = resolveGitBinary(options);
+    if (afterBin) {
+      return { ok: true, status: 'installed_via_winget', executable: afterBin };
+    }
+    const errText = ((installRes && (installRes.stderr || installRes.stdout)) || '').trim();
+    return {
+      ok: false,
+      status: 'install_failed',
+      executable: null,
+      detail: errText || 'winget install Git.Git did not produce git.exe (запустите команду вне песочницы)',
+    };
+  } catch (error) {
+    return { ok: false, status: 'install_failed', executable: null, detail: String(error.message || error) };
+  }
+}
+
+function isSandboxLoopbackError(text) {
+  return /Unable to establish loopback connection|Operation not permitted.*loopback|Permission denied.*127\.0\.0\.1/i.test(
+    String(text || '')
+  );
+}
+
+function extractEdtVersion(exePath) {
+  if (!exePath) return null;
+  const m = String(exePath).match(/(20\d{2}\.\d+(?:\.\d+)?)/);
+  return m ? m[1] : null;
+}
+
+function isEdtVersionSupported(versionStr) {
+  if (!versionStr) return true;
+  const parts = String(versionStr).split('.').map((n) => Number(n));
+  const year = parts[0];
+  const minor = parts[1] || 0;
+  if (!Number.isFinite(year)) return true;
+  return year > 2025 || (year === 2025 && minor >= 2);
+}
+
 function inspectGitIdentity(options = {}) {
   const env = options.env || process.env;
   const platform = options.platform || process.platform;
@@ -775,49 +830,100 @@ function discoverEdtInstallation(options = {}) {
   }
 
   candidates = [...new Set(candidates)].sort((a, b) => compareSemverDesc(a, b));
-  const selectedExe = candidates[0] || null;
-  if (!selectedExe) {
+  const workspaces = readEdtWorkspacePrefs(options);
+  if (candidates.length === 0) {
     return {
       installed: false,
+      unsupportedOnly: false,
+      unsupportedVersions: [],
       executable: null,
       javaExecutable: null,
       pluginInstalled: false,
+      allSupportedHavePlugin: false,
       pluginVersion: null,
-      workspaces: readEdtWorkspacePrefs(options),
+      supportedInstallations: [],
+      unsupportedInstallations: [],
+      workspaces,
       officialDownload: OFFICIAL_EDT_DOWNLOAD,
     };
   }
 
-  let javaExe = env.EDT_JAVA && isFile(env.EDT_JAVA)
-    ? path.resolve(env.EDT_JAVA)
-    : parseEdtIniVm(selectedExe, platform);
-
-  if (!javaExe && platform === 'win32') {
-    const compRoot = path.join(env.ProgramFiles || 'C:\\Program Files', '1C', '1CE', 'components');
-    if (isDir(compRoot)) {
-      const jdkDirs = fs.readdirSync(compRoot)
-        .filter((name) => name.startsWith('axiom-jdk-full-') || name.startsWith('liberica-jdk-'))
-        .sort(compareSemverDesc);
-      for (const jdk of jdkDirs) {
-        const javaw = path.join(compRoot, jdk, 'bin', 'javaw.exe');
-        if (isFile(javaw)) {
-          javaExe = javaw;
-          break;
+  const resolveJvmForEdt = (exe) => {
+    let jvm = env.EDT_JAVA && isFile(env.EDT_JAVA)
+      ? path.resolve(env.EDT_JAVA)
+      : parseEdtIniVm(exe, platform);
+    if (!jvm && platform === 'win32') {
+      const compRoot = path.join(env.ProgramFiles || 'C:\\Program Files', '1C', '1CE', 'components');
+      if (isDir(compRoot)) {
+        const jdkDirs = fs.readdirSync(compRoot)
+          .filter((name) => name.startsWith('axiom-jdk-full-') || name.startsWith('liberica-jdk-'))
+          .sort(compareSemverDesc);
+        for (const jdk of jdkDirs) {
+          const javaw = path.join(compRoot, jdk, 'bin', 'javaw.exe');
+          if (isFile(javaw)) {
+            jvm = javaw;
+            break;
+          }
         }
       }
     }
+    return jvm;
+  };
+
+  const allInstallations = candidates.map((exe) => {
+    const ver = extractEdtVersion(exe);
+    const supported = isEdtVersionSupported(ver);
+    const bundle = inspectEdtBundlesInfo(exe);
+    return {
+      executable: exe,
+      version: ver,
+      supported,
+      javaExecutable: resolveJvmForEdt(exe),
+      pluginInstalled: bundle.installed,
+      pluginVersion: bundle.bundleVersion,
+      bundlesInfoPath: bundle.bundlesInfoPath,
+    };
+  });
+
+  const supportedInstallations = allInstallations.filter((inst) => inst.supported);
+  const unsupportedInstallations = allInstallations.filter((inst) => !inst.supported);
+
+  if (supportedInstallations.length === 0) {
+    return {
+      installed: false,
+      unsupportedOnly: true,
+      unsupportedVersions: unsupportedInstallations.map((u) => u.version || u.executable),
+      executable: null,
+      allExecutables: candidates,
+      javaExecutable: null,
+      pluginInstalled: false,
+      allSupportedHavePlugin: false,
+      pluginVersion: null,
+      supportedInstallations: [],
+      unsupportedInstallations,
+      workspaces,
+      officialDownload: OFFICIAL_EDT_DOWNLOAD,
+    };
   }
 
-  const bundleState = inspectEdtBundlesInfo(selectedExe);
+  const primary = supportedInstallations[0];
+  const allSupportedHavePlugin = supportedInstallations.every((inst) => inst.pluginInstalled);
+  const anySupportedHasPlugin = supportedInstallations.some((inst) => inst.pluginInstalled);
+
   return {
     installed: true,
-    executable: selectedExe,
+    unsupportedOnly: false,
+    executable: primary.executable,
+    version: primary.version,
     allExecutables: candidates,
-    javaExecutable: javaExe,
-    pluginInstalled: bundleState.installed,
-    pluginVersion: bundleState.bundleVersion,
-    bundlesInfoPath: bundleState.bundlesInfoPath,
-    workspaces: readEdtWorkspacePrefs(options),
+    supportedInstallations,
+    unsupportedInstallations,
+    javaExecutable: primary.javaExecutable,
+    pluginInstalled: anySupportedHasPlugin,
+    allSupportedHavePlugin,
+    pluginVersion: primary.pluginVersion || (supportedInstallations.find((i) => i.pluginVersion)?.pluginVersion || null),
+    bundlesInfoPath: primary.bundlesInfoPath,
+    workspaces,
   };
 }
 
@@ -1035,6 +1141,19 @@ async function diagnoseEdtSubsystem(edtInfo, settingsData = {}, options = {}) {
     : (configuredPort || wsPorts[0] || 8765);
 
   if (!edtInfo.installed) {
+    if (edtInfo.unsupportedOnly) {
+      return {
+        status: 'edt_version_unsupported',
+        unsupportedVersions: edtInfo.unsupportedVersions || [],
+        detail: `Найдена устаревшая версия 1С:EDT (${(edtInfo.unsupportedVersions || []).join(', ')}), а плагин EDT MCP поддерживает линейки 2025.2, 2026.1 и 2026.2. Откройте установщик 1C:EDT Start и установите актуальную версию 2026.1 или 2026.2.`,
+        port8765Conflict: Boolean(port8765Conflict),
+        portConflictDetail: port8765Conflict ? port8765Conflict.detail : null,
+        suggestedPort,
+        edt: edtInfo,
+        officialDownload: OFFICIAL_EDT_DOWNLOAD,
+        probes,
+      };
+    }
     return {
       status: 'edt_not_installed',
       port8765Conflict: Boolean(port8765Conflict),
@@ -1046,9 +1165,10 @@ async function diagnoseEdtSubsystem(edtInfo, settingsData = {}, options = {}) {
     };
   }
 
-  if (!edtInfo.pluginInstalled) {
+  if (!edtInfo.pluginInstalled || edtInfo.allSupportedHavePlugin === false) {
     return {
       status: 'plugin_not_installed',
+      partiallyInstalled: Boolean(edtInfo.pluginInstalled && edtInfo.allSupportedHavePlugin === false),
       port8765Conflict: Boolean(port8765Conflict),
       portConflictDetail: port8765Conflict ? port8765Conflict.detail : null,
       suggestedPort,
@@ -1466,23 +1586,38 @@ async function resolveEdtP2Repository(options = {}) {
         detail: 'Не найден mise для локальной сборки ./edt-mcp (JDK 25 + Maven 3.9). Установите mise.',
       };
     }
-    spawnSync(miseBin, ['trust'], { cwd: dir, stdio: 'inherit', windowsHide: true });
+    const echoOut = (res) => {
+      if (options.quietBuild) return;
+      if (res && res.stdout) process.stdout.write(res.stdout);
+      if (res && res.stderr) process.stderr.write(res.stderr);
+    };
+    spawnSync(miseBin, ['trust'], { cwd: dir, encoding: 'utf8', windowsHide: true });
     const installRes = spawnSync(miseBin, ['install'], {
       cwd: dir,
-      stdio: 'inherit',
+      encoding: 'utf8',
       windowsHide: true,
       timeout: 600000,
     });
+    echoOut(installRes);
     if (installRes.status !== 0) {
+      const combinedInstall = `${installRes.stdout || ''}\n${installRes.stderr || ''}`;
+      if (isSandboxLoopbackError(combinedInstall)) {
+        return { ok: false, reason: 'sandbox_loopback_blocked', detail: combinedInstall.trim() };
+      }
       return { ok: false, detail: `mise install в ${dir} завершился с кодом ${installRes.status}` };
     }
     const buildRes = spawnSync(miseBin, ['run', 'build'], {
       cwd: dir,
-      stdio: 'inherit',
+      encoding: 'utf8',
       windowsHide: true,
       timeout: 900000,
     });
+    echoOut(buildRes);
     if (buildRes.status !== 0) {
+      const combinedBuild = `${buildRes.stdout || ''}\n${buildRes.stderr || ''}`;
+      if (isSandboxLoopbackError(combinedBuild)) {
+        return { ok: false, reason: 'sandbox_loopback_blocked', detail: combinedBuild.trim() };
+      }
       return { ok: false, detail: `mise run build в ${dir} завершился с кодом ${buildRes.status}` };
     }
     return { ok: true };
@@ -1491,6 +1626,16 @@ async function resolveEdtP2Repository(options = {}) {
   const buildOutcome = buildRunner(edtMcpDir);
   if (buildOutcome.ok && isDir(localBuilt)) {
     return { ok: true, source: 'built-from-local-source', path: localBuilt };
+  }
+
+  if (buildOutcome.reason === 'sandbox_loopback_blocked' || isSandboxLoopbackError(buildOutcome.detail)) {
+    return {
+      ok: false,
+      reason: 'sandbox_loopback_blocked',
+      detail:
+        'Песочница клиента ИИ на Windows заблокировала локальные loopback-сокеты Java (Unable to establish loopback connection). ' +
+        'Перезапустите команду вне песочницы (с повышенными разрешениями в клиенте ИИ).',
+    };
   }
 
   return {
@@ -1530,13 +1675,38 @@ function writeEdtWorkspacePortPrefs(workspaceDir, port) {
 async function deployEdtPlugin(options = {}) {
   const edtInfo = discoverEdtInstallation(options);
   if (!edtInfo.installed) {
+    if (edtInfo.unsupportedOnly) {
+      return {
+        ok: false,
+        status: 'edt_version_unsupported',
+        unsupportedVersions: edtInfo.unsupportedVersions || [],
+        officialDownload: OFFICIAL_EDT_DOWNLOAD,
+        detail:
+          `Найдена устаревшая версия 1С:EDT (${(edtInfo.unsupportedVersions || []).join(', ')}), а плагин EDT MCP поддерживает версии 2025.2, 2026.1 и 2026.2. ` +
+          'Откройте 1C:EDT Start и установите актуальную версию 2026.1 или 2026.2.',
+      };
+    }
     return {
       ok: false,
       status: 'edt_not_installed',
       officialDownload: OFFICIAL_EDT_DOWNLOAD,
     };
   }
-  if (!edtInfo.javaExecutable) {
+
+  const targets =
+    Array.isArray(edtInfo.supportedInstallations) && edtInfo.supportedInstallations.length > 0
+      ? edtInfo.supportedInstallations
+      : [
+          {
+            executable: edtInfo.executable,
+            version: edtInfo.version || null,
+            javaExecutable: edtInfo.javaExecutable,
+            pluginInstalled: edtInfo.pluginInstalled,
+          },
+        ];
+
+  const targetsWithJava = targets.filter((t) => Boolean(t.javaExecutable));
+  if (targetsWithJava.length === 0) {
     return {
       ok: false,
       status: 'edt_java_missing',
@@ -1549,54 +1719,97 @@ async function deployEdtPlugin(options = {}) {
     return { ok: false, status: p2.reason, detail: p2.detail, edt: edtInfo };
   }
 
-  if (isEdtProcessRunning(edtInfo.executable, options.platform || process.platform)) {
-    return {
-      ok: false,
-      status: 'edt_running_close_required',
-      p2RepositoryPath: p2.path,
-      detail: `Окно 1С:EDT сейчас открыто (${edtInfo.executable}). Чтобы не повредить профиль Eclipse, закройте 1С:EDT и повторите deploy-edt, либо в открытой 1С:EDT выберите «Справка → Установить новое ПО → Добавить → Локальный» и укажите папку: ${p2.path}`,
-    };
-  }
+  const isRunningCheck =
+    options.isEdtRunningFn ||
+    ((exe) => isEdtProcessRunning(exe, options.platform || process.platform));
+  const directorRunner =
+    options.runDirectorFn ||
+    ((exe, args) =>
+      spawnSync(exe, args, {
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 180000,
+      }));
 
   const repoUri = 'file:///' + p2.path.replace(/\\/g, '/').replace(/^\/+/, '');
-  const directorArgs = [];
-  if (edtInfo.javaExecutable) {
-    directorArgs.push('-vm', edtInfo.javaExecutable);
-  }
-  directorArgs.push(
-    '-nosplash',
-    '-application',
-    'org.eclipse.equinox.p2.director',
-    '-repository',
-    repoUri
-  );
-  if (edtInfo.pluginInstalled) {
-    directorArgs.push('-uninstallIU', EDT_FEATURE_ID);
-  }
-  directorArgs.push('-installIU', EDT_FEATURE_ID, '-profileProperties', 'org.eclipse.update.reconcile=true');
+  const installedTargets = [];
+  const skippedRunning = [];
+  const failedTargets = [];
 
-  const res = spawnSync(edtInfo.executable, directorArgs, {
-    encoding: 'utf8',
-    windowsHide: true,
-    timeout: 180000,
-  });
+  for (const target of targetsWithJava) {
+    if (isRunningCheck(target.executable)) {
+      skippedRunning.push(target.executable);
+      continue;
+    }
+    const directorArgs = [];
+    if (target.javaExecutable) {
+      directorArgs.push('-vm', target.javaExecutable);
+    }
+    directorArgs.push(
+      '-nosplash',
+      '-application',
+      'org.eclipse.equinox.p2.director',
+      '-repository',
+      repoUri
+    );
+    if (target.pluginInstalled) {
+      directorArgs.push('-uninstallIU', EDT_FEATURE_ID);
+    }
+    directorArgs.push('-installIU', EDT_FEATURE_ID, '-profileProperties', 'org.eclipse.update.reconcile=true');
 
-  if (res.status !== 0) {
+    const res = directorRunner(target.executable, directorArgs);
+    if (res.status === 0) {
+      installedTargets.push({ executable: target.executable, version: target.version || null });
+    } else {
+      const combinedOut = `${res.stderr || ''}\n${res.stdout || ''}`.trim();
+      if (isSandboxLoopbackError(combinedOut)) {
+        return {
+          ok: false,
+          status: 'sandbox_loopback_blocked',
+          p2RepositoryPath: p2.path,
+          detail:
+            'Песочница клиента ИИ на Windows заблокировала локальные loopback-сокеты Java при вызове p2.director (Unable to establish loopback connection). ' +
+            'Перезапустите deploy-edt вне песочницы (с повышенными разрешениями).',
+        };
+      }
+      failedTargets.push({
+        executable: target.executable,
+        version: target.version || null,
+        exitCode: res.status,
+        detail: combinedOut || `p2.director exited with ${res.status}`,
+      });
+    }
+  }
+
+  if (installedTargets.length === 0) {
+    if (skippedRunning.length > 0 && failedTargets.length === 0) {
+      return {
+        ok: false,
+        status: 'edt_running_close_required',
+        p2RepositoryPath: p2.path,
+        runningExecutables: skippedRunning,
+        detail: `Окно 1С:EDT сейчас открыто (${skippedRunning.join(', ')}). Чтобы не повредить профиль Eclipse, закройте 1С:EDT и повторите deploy-edt, либо в открытой 1С:EDT выберите «Справка → Установить новое ПО → Добавить → Локальный» и укажите папку: ${p2.path}`,
+      };
+    }
+    const firstFail = failedTargets[0] || { exitCode: 1, detail: 'p2.director failed' };
     return {
       ok: false,
       status: 'p2_director_failed',
-      exitCode: res.status,
+      exitCode: firstFail.exitCode,
       p2RepositoryPath: p2.path,
-      detail: (res.stderr || res.stdout || `p2.director exited with ${res.status}`).trim(),
+      failedTargets,
+      detail: firstFail.detail,
     };
   }
 
   // Choose clean port (avoiding occupied 8765 if foreign process holds it)
   let targetPort = options.port ? Number(options.port) : 8765;
   if (!options.port) {
-    const p8765 = await probeEdtMcpPort(8765);
+    const probeFn = options.probePortFn || probeEdtMcpPort;
+    const freeFn = options.findFreePortFn || findFreeLocalPort;
+    const p8765 = await probeFn(8765);
     if (p8765.state === 'foreign_service') {
-      targetPort = await findFreeLocalPort(8766);
+      targetPort = await freeFn(8766);
     }
   }
 
@@ -1608,9 +1821,10 @@ async function deployEdtPlugin(options = {}) {
     }
   }
 
+  const primaryInstalledExe = installedTargets[0].executable || edtInfo.executable;
   const endpoint = `http://127.0.0.1:${targetPort}/mcp`;
   writeMergedSettings(
-    { edt_executable: edtInfo.executable, edt_mcp_url: endpoint },
+    { edt_executable: primaryInstalledExe, edt_mcp_url: endpoint },
     options.settingsPath || null,
     options
   );
@@ -1620,7 +1834,10 @@ async function deployEdtPlugin(options = {}) {
     status: 'installed',
     p2Source: p2.source,
     p2RepositoryPath: p2.path,
-    edtExecutable: edtInfo.executable,
+    edtExecutable: primaryInstalledExe,
+    installedTargets,
+    skippedRunning,
+    failedTargets,
     endpoint,
     port: targetPort,
     updatedWorkspaces,
@@ -1632,7 +1849,11 @@ async function runDeploy(options = {}) {
   const repoRoot = findRepoCloneRoot(options);
   const platform = options.platform || process.platform;
   const miseBin = resolveMiseBinary(options);
-  const gitBin = resolveGitBinary(options) || 'git';
+  const gitEnsure = ensureGitOnWindows(options);
+  if (platform === 'win32' || gitEnsure.status !== 'already_present') {
+    steps.push({ step: 'windows_git', ...gitEnsure });
+  }
+  const gitBin = gitEnsure.executable || resolveGitBinary(options) || 'git';
 
   // 1. Optional Windows User Path fix when global node is broken/missing
   const nodeStateBefore = inspectNodeAndPath(options);
@@ -1719,10 +1940,10 @@ async function runDeploy(options = {}) {
   const edtInfo = discoverEdtInstallation(options);
 
   let edtDeployResult = null;
-  if (!options.skipEdt && edtInfo.installed && !edtInfo.pluginInstalled) {
+  if (!options.skipEdt && edtInfo.installed && (!edtInfo.pluginInstalled || edtInfo.allSupportedHavePlugin === false)) {
     edtDeployResult = await deployEdtPlugin({ ...options, repoRoot });
     steps.push({ step: 'edt_mcp_deploy', ...edtDeployResult });
-  } else if (options.openEdtDownload && !edtInfo.installed) {
+  } else if (options.openEdtDownload && !edtInfo.installed && !edtInfo.unsupportedOnly) {
     const browserRes = openUrlInSystemBrowser('edt', options);
     steps.push({ step: 'open_edt_download_browser', ...browserRes });
   }
@@ -1786,11 +2007,17 @@ function formatHumanDoctorReport(report) {
   );
 
   const edt = report.edt;
+  const supportedList = (edt.edt && Array.isArray(edt.edt.supportedInstallations))
+    ? edt.edt.supportedInstallations
+    : [];
+  const multiEdtNote = supportedList.length > 1
+    ? ` [всего поддерживаемых версий EDT на диске: ${supportedList.map((i) => i.version || i.executable).join(', ')}]`
+    : '';
   if (edt.status === 'ready') {
-    lines.push(`5. 1С:EDT и EDT MCP: ГОТОВ (${edt.endpoint}, EDT ${edt.edtVersion || ''})`);
+    lines.push(`5. 1С:EDT и EDT MCP: ГОТОВ (${edt.endpoint}, EDT ${edt.edtVersion || ''})${multiEdtNote}`);
   } else if (edt.status === 'edt_not_running') {
     lines.push(
-      `5. 1С:EDT и EDT MCP: ПЛАГИН УСТАНОВЛЕН в 1С:EDT (${edt.edt.executable}), но окно 1С:EDT сейчас закрыто (ожидаемый адрес: ${edt.endpoint})`
+      `5. 1С:EDT и EDT MCP: ПЛАГИН УСТАНОВЛЕН в 1С:EDT (${edt.edt.executable})${multiEdtNote}, но окно 1С:EDT сейчас закрыто (ожидаемый адрес: ${edt.endpoint})`
     );
   } else if (edt.status === 'port_conflict') {
     lines.push(
@@ -1798,7 +2025,11 @@ function formatHumanDoctorReport(report) {
     );
   } else if (edt.status === 'plugin_not_installed') {
     lines.push(
-      `5. 1С:EDT и EDT MCP: 1С:EDT найдена (${edt.edt.executable}), но плагин EDT MCP ещё не установлен. Выполните: node .agents/plugins/1c-ai-pipeline/bin/pipeline-deploy.cjs deploy-edt`
+      `5. 1С:EDT и EDT MCP: 1С:EDT найдена (${edt.edt.executable})${multiEdtNote}, но плагин EDT MCP установлен не во все найденные версии. Выполните: node .agents/plugins/1c-ai-pipeline/bin/pipeline-deploy.cjs deploy-edt`
+    );
+  } else if (edt.status === 'edt_version_unsupported') {
+    lines.push(
+      `5. 1С:EDT и EDT MCP: ТРЕБУЕТСЯ ОБНОВЛЕНИЕ EDT — ${edt.detail}`
     );
   } else {
     lines.push('5. 1С:EDT и EDT MCP: 1С:EDT на этом компьютере НЕ УСТАНОВЛЕНА.');
@@ -1927,6 +2158,10 @@ module.exports = {
   inspectNodeAndPath,
   fixWindowsUserPathForMise,
   resolveGitBinary,
+  ensureGitOnWindows,
+  isSandboxLoopbackError,
+  extractEdtVersion,
+  isEdtVersionSupported,
   inspectGitIdentity,
   configureGitIdentity,
   openUrlInSystemBrowser,

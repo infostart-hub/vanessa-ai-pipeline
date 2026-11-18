@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "1c-ai-pipeline",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Навыки, правила, защитные хуки и MCP-инструменты для анализа и развития решений на 1С: работа с требованиями, исходным кодом, метаданными, формами, отчётами, интеграциями, правами и сценариями тестирования.",
   "author": {
     "name": "infostart-hub",
