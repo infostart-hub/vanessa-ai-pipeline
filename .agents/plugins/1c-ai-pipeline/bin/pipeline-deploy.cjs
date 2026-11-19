@@ -45,21 +45,24 @@ const FORK_REPOS = [
 
 const EDT_FEATURE_ID = 'com.ditrix.edt.mcp.server.feature.feature.group';
 const EDT_BUNDLE_PREFIX = 'com.ditrix.edt.mcp.server,';
+const WORKMATE_BUNDLE_PREFIX = 'com.e1c.edt.ai,';
 const EDT_RELEASE_API_URL = 'https://api.github.com/repos/infostart-hub/edt-mcp-aiadopted/releases/latest';
 
 const OFFICIAL_EDT_DOWNLOAD = {
   landingUrl: 'https://edt.1c.ru/',
   releasesUrl: 'https://releases.1c.ru/project/DevelopmentTools10',
   communityLicenseUrl: 'https://developer.1c.ru/',
+  workmateUrl: 'https://code.1c.ai/',
   supportedSeries: ['2025.2', '2026.1', '2026.2'],
   summaryRu:
-    'Дистрибутив 1C:EDT Start и 1С:EDT скачивается бесплатно с https://edt.1c.ru/ или https://releases.1c.ru/project/DevelopmentTools10 по обычной бесплатной учётной записи portal.1c.ru (платный договор ИТС для скачивания EDT не требуется). Через 1C:EDT Start установите 1С:EDT 2025.2, 2026.1 или 2026.2 (нужная Java с JavaFX ставится автоматически). Бесплатная комьюнити-лицензия разработчика 1С при необходимости оформляется на https://developer.1c.ru/.',
+    'Дистрибутив 1C:EDT Start и 1С:EDT скачивается бесплатно с https://edt.1c.ru/ или https://releases.1c.ru/project/DevelopmentTools10 по обычной бесплатной учётной записи portal.1c.ru (платный договор ИТС для скачивания EDT не требуется). Через 1C:EDT Start установите 1С:EDT 2025.2, 2026.1 или 2026.2 (нужная Java с JavaFX ставится автоматически). Ключ для 1С:Напарник получается на https://code.1c.ai/, бесплатная комьюнити-лицензия разработчика 1С — на https://developer.1c.ru/.',
 };
 
 const ALLOWED_BROWSER_TARGETS = {
   edt: OFFICIAL_EDT_DOWNLOAD.landingUrl,
   releases: OFFICIAL_EDT_DOWNLOAD.releasesUrl,
   license: OFFICIAL_EDT_DOWNLOAD.communityLicenseUrl,
+  workmate: OFFICIAL_EDT_DOWNLOAD.workmateUrl,
 };
 
 function defaultSettingsPath(env = process.env, platform = process.platform, homedir = os.homedir()) {
@@ -581,7 +584,124 @@ function discoverPlatforms(options = {}) {
 
   return [...found.entries()]
     .sort((a, b) => compareSemverDesc(a[0], b[0]))
-    .map(([version, clientPath]) => ({ version, clientPath }));
+    .map(([version, clientPath]) => {
+      const binDir = path.dirname(clientPath);
+      const ibsrvCand = path.join(binDir, platform === 'win32' ? 'ibsrv.exe' : 'ibsrv');
+      const ibcmdCand = path.join(binDir, platform === 'win32' ? 'ibcmd.exe' : 'ibcmd');
+      const ibsrvPath = isFile(ibsrvCand) ? ibsrvCand : null;
+      const ibcmdPath = isFile(ibcmdCand) ? ibcmdCand : null;
+      return {
+        version,
+        clientPath,
+        ibsrvPath,
+        ibcmdPath,
+        standaloneServerAvailable: Boolean(ibsrvPath && ibcmdPath),
+      };
+    });
+}
+
+function discoverRegisteredInfobases(options = {}) {
+  const env = options.env || process.env;
+  const platform = options.platform || process.platform;
+  const homedir = options.homedir !== undefined ? options.homedir : os.homedir();
+  const candidates = [
+    options.ibasesPath,
+    platform === 'win32' && env.APPDATA ? path.join(env.APPDATA, '1C', '1CEStart', 'ibases.v8i') : null,
+    homedir ? path.join(homedir, '.1C', '1cestart', 'ibases.v8i') : null,
+    homedir ? path.join(homedir, 'Library', 'Application Support', '1C', '1cestart', 'ibases.v8i') : null,
+  ].filter(Boolean);
+
+  const v8iFile = candidates.find(isFile) || null;
+  if (!v8iFile) {
+    return { v8iPath: null, total: 0, byKind: { file: 0, standalone_or_web: 0, cluster_or_direct: 0 }, entries: [] };
+  }
+
+  let raw = '';
+  try {
+    raw = fs.readFileSync(v8iFile, 'utf8').replace(/^\uFEFF/, '');
+  } catch {
+    return { v8iPath: v8iFile, total: 0, byKind: { file: 0, standalone_or_web: 0, cluster_or_direct: 0 }, entries: [] };
+  }
+
+  const entries = [];
+  let currentName = null;
+  let currentConnect = null;
+  let currentApp = null;
+
+  const flushSection = () => {
+    if (!currentName || !currentConnect) return;
+    // Strip any Usr= / Pwd= segments so credentials are NEVER leaked
+    const safeSegments = currentConnect
+      .split(';')
+      .map((s) => s.trim())
+      .filter((s) => s && !/^(Usr|Pwd)\s*=/i.test(s));
+
+    const getParam = (key) => {
+      const prefix = key.toLowerCase() + '=';
+      const hit = safeSegments.find((s) => s.toLowerCase().startsWith(prefix));
+      if (!hit) return null;
+      return hit.slice(prefix.length).trim().replace(/^"|"$/g, '');
+    };
+
+    const fileVal = getParam('File');
+    const wsVal = getParam('ws');
+    const srvrVal = getParam('Srvr');
+    const refVal = getParam('Ref');
+
+    if (fileVal) {
+      entries.push({
+        name: currentName,
+        kind: 'file',
+        filePath: fileVal,
+        exists: isFile(path.join(fileVal, '1Cv8.1CD')),
+        normalizedConnection: `/F"${fileVal}"`,
+        app: currentApp || null,
+      });
+    } else if (wsVal) {
+      entries.push({
+        name: currentName,
+        kind: 'standalone_or_web',
+        webUrl: wsVal,
+        normalizedConnection: `/WS"${wsVal}"`,
+        app: currentApp || null,
+      });
+    } else if (srvrVal && refVal) {
+      entries.push({
+        name: currentName,
+        kind: 'cluster_or_direct',
+        server: srvrVal,
+        ref: refVal,
+        normalizedConnection: `/S"${srvrVal}\\${refVal}"`,
+        app: currentApp || null,
+      });
+    }
+  };
+
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith(';')) continue;
+    const secMatch = line.match(/^\[(.+)\]$/);
+    if (secMatch) {
+      flushSection();
+      currentName = secMatch[1].trim();
+      currentConnect = null;
+      currentApp = null;
+      continue;
+    }
+    if (/^Connect\s*=/i.test(line)) {
+      currentConnect = line.replace(/^Connect\s*=\s*/i, '').trim();
+    } else if (/^App\s*=/i.test(line)) {
+      currentApp = line.replace(/^App\s*=\s*/i, '').trim();
+    }
+  }
+  flushSection();
+
+  const byKind = {
+    file: entries.filter((e) => e.kind === 'file').length,
+    standalone_or_web: entries.filter((e) => e.kind === 'standalone_or_web').length,
+    cluster_or_direct: entries.filter((e) => e.kind === 'cluster_or_direct').length,
+  };
+  return { v8iPath: v8iFile, total: entries.length, byKind, entries };
 }
 
 function parseEdtIniVm(edtExecutable, platform = process.platform) {
@@ -624,7 +744,15 @@ function parseEdtIniVm(edtExecutable, platform = process.platform) {
 }
 
 function inspectEdtBundlesInfo(edtExecutable) {
-  if (!edtExecutable) return { installed: false, bundleVersion: null, bundlesInfoPath: null };
+  if (!edtExecutable) {
+    return {
+      installed: false,
+      bundleVersion: null,
+      workmateInstalled: false,
+      workmateVersion: null,
+      bundlesInfoPath: null,
+    };
+  }
   const edtDir = path.dirname(edtExecutable);
   const candidates = [
     path.join(edtDir, 'configuration', 'org.eclipse.equinox.simpleconfigurator', 'bundles.info'),
@@ -634,22 +762,37 @@ function inspectEdtBundlesInfo(edtExecutable) {
     if (!isFile(infoPath)) continue;
     try {
       const lines = fs.readFileSync(infoPath, 'utf8').split(/\r?\n/);
+      let mcpInstalled = false;
+      let mcpVersion = null;
+      let workmateInstalled = false;
+      let workmateVersion = null;
       for (const line of lines) {
         if (line.startsWith(EDT_BUNDLE_PREFIX)) {
-          const parts = line.split(',');
-          return {
-            installed: true,
-            bundleVersion: parts[1] || null,
-            bundlesInfoPath: infoPath,
-          };
+          mcpInstalled = true;
+          mcpVersion = line.split(',')[1] || null;
+        } else if (line.startsWith(WORKMATE_BUNDLE_PREFIX)) {
+          workmateInstalled = true;
+          workmateVersion = line.split(',')[1] || null;
         }
       }
-      return { installed: false, bundleVersion: null, bundlesInfoPath: infoPath };
+      return {
+        installed: mcpInstalled,
+        bundleVersion: mcpVersion,
+        workmateInstalled,
+        workmateVersion,
+        bundlesInfoPath: infoPath,
+      };
     } catch {
       // Ignore
     }
   }
-  return { installed: false, bundleVersion: null, bundlesInfoPath: null };
+  return {
+    installed: false,
+    bundleVersion: null,
+    workmateInstalled: false,
+    workmateVersion: null,
+    bundlesInfoPath: null,
+  };
 }
 
 function walkForFile(rootDir, targetNames, maxDepth = 4) {
@@ -727,12 +870,40 @@ function readEdtWorkspacePrefs(options = {}) {
   }
 
   const discovered = [];
+  const inspectWorkspaceWorkmatePrefs = (wsDir) => {
+    const settingsDir = path.join(wsDir, '.metadata', '.plugins', 'org.eclipse.core.runtime', '.settings');
+    if (!isDir(settingsDir)) return { prefsPresent: false, tokenHintPresent: false };
+    try {
+      const aiFiles = fs.readdirSync(settingsDir).filter((f) => f.startsWith('com.e1c.edt.ai') && f.endsWith('.prefs'));
+      if (aiFiles.length === 0) return { prefsPresent: false, tokenHintPresent: false };
+      let tokenHintPresent = false;
+      for (const f of aiFiles) {
+        const content = fs.readFileSync(path.join(settingsDir, f), 'utf8');
+        // Check only non-empty key presence; NEVER store or return the secret value
+        if (/^(?:token|clientToken|apiKey|accessToken|authToken)\s*=\s*\S+/im.test(content)) {
+          tokenHintPresent = true;
+        }
+      }
+      return { prefsPresent: true, tokenHintPresent };
+    } catch {
+      return { prefsPresent: false, tokenHintPresent: false };
+    }
+  };
+
   for (const ws of workspaceCandidates) {
     if (!ws || !isDir(ws)) continue;
     const prefsFile = path.join(ws, prefsRel);
+    const wmPrefs = inspectWorkspaceWorkmatePrefs(ws);
     if (!isFile(prefsFile)) {
       if (isDir(path.join(ws, '.metadata'))) {
-        discovered.push({ workspace: ws, prefsFile: null, port: null, autoStart: null });
+        discovered.push({
+          workspace: ws,
+          prefsFile: null,
+          port: null,
+          autoStart: null,
+          workmatePrefsPresent: wmPrefs.prefsPresent,
+          workmateTokenHintPresent: wmPrefs.tokenHintPresent,
+        });
       }
       continue;
     }
@@ -745,6 +916,8 @@ function readEdtWorkspacePrefs(options = {}) {
         prefsFile,
         port: portMatch ? Number(portMatch[1]) : null,
         autoStart: autoMatch ? autoMatch[1] === 'true' : null,
+        workmatePrefsPresent: wmPrefs.prefsPresent,
+        workmateTokenHintPresent: wmPrefs.tokenHintPresent,
       });
     } catch {
       // Ignore
@@ -881,6 +1054,8 @@ function discoverEdtInstallation(options = {}) {
       javaExecutable: resolveJvmForEdt(exe),
       pluginInstalled: bundle.installed,
       pluginVersion: bundle.bundleVersion,
+      workmateInstalled: Boolean(bundle.workmateInstalled),
+      workmateVersion: bundle.workmateVersion || null,
       bundlesInfoPath: bundle.bundlesInfoPath,
     };
   });
@@ -909,6 +1084,7 @@ function discoverEdtInstallation(options = {}) {
   const primary = supportedInstallations[0];
   const allSupportedHavePlugin = supportedInstallations.every((inst) => inst.pluginInstalled);
   const anySupportedHasPlugin = supportedInstallations.some((inst) => inst.pluginInstalled);
+  const anyWorkmateInstalled = supportedInstallations.some((inst) => inst.workmateInstalled);
 
   return {
     installed: true,
@@ -922,6 +1098,8 @@ function discoverEdtInstallation(options = {}) {
     pluginInstalled: anySupportedHasPlugin,
     allSupportedHavePlugin,
     pluginVersion: primary.pluginVersion || (supportedInstallations.find((i) => i.pluginVersion)?.pluginVersion || null),
+    workmateInstalled: anyWorkmateInstalled,
+    workmateVersion: primary.workmateVersion || (supportedInstallations.find((i) => i.workmateVersion)?.workmateVersion || null),
     bundlesInfoPath: primary.bundlesInfoPath,
     workspaces,
   };
@@ -1025,6 +1203,7 @@ async function probeEdtMcpPort(port, host = '127.0.0.1', timeoutMs = 2000) {
       if (parsed?.result && (serverName.toLowerCase().includes('edt') || healthJson?.edtVersion !== undefined)) {
         const sessionId = mcpResp.headers['mcp-session-id'];
         let projects = null;
+        let serverStatus = null;
         if (sessionId) {
           await httpRequestSimple(`${baseUrl}/mcp`, {
             method: 'POST',
@@ -1061,13 +1240,44 @@ async function probeEdtMcpPort(port, host = '127.0.0.1', timeoutMs = 2000) {
               projects = null;
             }
           }
+          const statusResp = await httpRequestSimple(`${baseUrl}/mcp`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json, text/event-stream',
+              'MCP-Protocol-Version': '2025-06-18',
+              'Mcp-Session-Id': sessionId,
+            },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: 3,
+              method: 'tools/call',
+              params: { name: 'get_server_status', arguments: {} },
+            }),
+            timeoutMs: 3000,
+          });
+          if (statusResp.ok && statusResp.statusCode === 200) {
+            try {
+              const statusJson = parseMcpHttpBody(statusResp.body, statusResp.headers['content-type']);
+              if (statusJson?.result?.structuredContent) {
+                serverStatus = statusJson.result.structuredContent;
+              } else {
+                const txt = statusJson?.result?.content?.[0]?.text;
+                serverStatus = txt ? JSON.parse(txt) : null;
+              }
+            } catch {
+              serverStatus = null;
+            }
+          }
         }
         return {
           port,
           state: 'edt_mcp_ready',
           endpoint: `${baseUrl}/mcp`,
-          edtVersion: healthJson?.edtVersion || null,
+          edtVersion: healthJson?.edtVersion || serverStatus?.edtVersion || null,
           serverInfo: parsed.result.serverInfo || null,
+          serverStatus,
+          workmate: serverStatus?.workmate || null,
           projects,
         };
       }
@@ -1117,6 +1327,24 @@ async function diagnoseEdtSubsystem(edtInfo, settingsData = {}, options = {}) {
   const candidatePorts = [...new Set([configuredPort, ...wsPorts, 8765, 8766].filter(Boolean))];
   const probeFn = options.probePortFn || probeEdtMcpPort;
 
+  const offlineWorkmateSummary = () => {
+    const installedInBundle = Boolean(edtInfo && edtInfo.workmateInstalled);
+    const tokenHint = Array.isArray(edtInfo?.workspaces) && edtInfo.workspaces.some((w) => w.workmateTokenHintPresent);
+    return {
+      installed: installedInBundle,
+      version: edtInfo?.workmateVersion || null,
+      tokenHintInWorkspacePrefs: Boolean(tokenHint),
+      status: !edtInfo?.installed
+        ? 'edt_not_installed'
+        : !installedInBundle
+          ? 'not_installed'
+          : tokenHint
+            ? 'configured_offline_verify_in_edt'
+            : 'needs_activation_and_live_check',
+      activationUrl: OFFICIAL_EDT_DOWNLOAD.workmateUrl,
+    };
+  };
+
   const probes = [];
   for (const port of candidatePorts) {
     const res = await probeFn(port);
@@ -1128,6 +1356,7 @@ async function diagnoseEdtSubsystem(edtInfo, settingsData = {}, options = {}) {
         port: res.port,
         edtVersion: res.edtVersion,
         projects: res.projects,
+        workmate: res.workmate || offlineWorkmateSummary(),
         edt: edtInfo,
         probes,
       };
@@ -1191,6 +1420,7 @@ async function diagnoseEdtSubsystem(edtInfo, settingsData = {}, options = {}) {
     status: 'edt_not_running',
     endpoint: `http://127.0.0.1:${suggestedPort}/mcp`,
     suggestedPort,
+    workmate: offlineWorkmateSummary(),
     edt: edtInfo,
     probes,
   };
@@ -1310,6 +1540,7 @@ async function runDoctor(options = {}) {
   const gitIdentity = inspectGitIdentity(options);
   const aiClients = discoverAiClients(options);
   const platforms = discoverPlatforms(options);
+  const infobases = discoverRegisteredInfobases(options);
   const runnerDiag = diagnoseRunnerLauncher(options.settingsPath || null, options);
   const runnerLauncherReady = runnerDiag.checks.every((c) => c.ok);
 
@@ -1331,7 +1562,9 @@ async function runDoctor(options = {}) {
     gitIdentity,
     aiClients,
     platforms,
+    infobases,
     selectedPlatform: settingsData.v8version || (platforms[0] ? platforms[0].version : null),
+    standaloneServerRuntimeAvailable: platforms.some((p) => p.standaloneServerAvailable),
     vanessaRunner: {
       ready: runnerLauncherReady && (runnerMcpProbe ? runnerMcpProbe.ok : true),
       oscript: runnerDiag.oscript,
@@ -1345,10 +1578,13 @@ async function runDoctor(options = {}) {
     humanChecklist: {
       gitAuthorConfigured: gitIdentity.configured,
       edtInstalled: Boolean(edtInfo.installed),
+      workmateActivated: edtSubsystem.workmate?.status === 'ready',
+      workmateActivationHintRu:
+        'Получите ключ доступа 1С:Напарник на https://code.1c.ai/, укажите его в настройках 1С:EDT (Окно → Параметры → 1С:Напарник) и проверьте связь через EDT-MCP (get_server_status / ask_workmate).',
       releaseEngineerRepoHintRu:
         'Попросите у релиз-инженера доступ к репозиторию конфигурации 1С (КА / ЗУП / вашей базы) на вашу корпоративную почту и пришлите полученную ссылку в чат — ИИ сам скачает проект.',
       manualTestDbLicenseHintRu:
-        'Откройте локальную тестовую копию базы (не боевую!) 1 раз вручную в «1С:Предприятии» и убедитесь, что она запускается без окна лицензии (при необходимости активируйте корп. пин-код или бесплатную комьюнити-лицензию с https://developer.1c.ru/).',
+        'Откройте локальную тестовую копию базы или базу на Автономном сервере 1С (не боевую!) 1 раз вручную в «1С:Предприятии» и убедитесь, что она запускается без окна лицензии (при необходимости активируйте корп. пин-код или бесплатную комьюнити-лицензию с https://developer.1c.ru/).',
     },
     onboardingModes: {
       directDatabaseModeReady: canWorkWithoutEdtNow,
@@ -1983,7 +2219,14 @@ function formatHumanDoctorReport(report) {
   lines.push(
     `2. Платформа 1С:Предприятие: ${
       report.platforms.length > 0
-        ? report.platforms.map((p) => `${p.version} (${p.clientPath})`).join(', ')
+        ? report.platforms
+            .map(
+              (p) =>
+                `${p.version} (${p.clientPath}${
+                  p.standaloneServerAvailable ? ', автономный сервер ibsrv+ibcmd: ЕСТЬ' : ''
+                })`
+            )
+            .join(', ')
         : 'НЕ НАЙДЕНА в стандартных каталогах'
     }`
   );
@@ -2039,6 +2282,40 @@ function formatHumanDoctorReport(report) {
     lines.push(`   Официальный установщик 1С:EDT (бесплатно): ${OFFICIAL_EDT_DOWNLOAD.landingUrl}`);
     lines.push(`   Раздел на портале релизов 1С: ${OFFICIAL_EDT_DOWNLOAD.releasesUrl}`);
     lines.push(`   Комьюнити-лицензия разработчика 1С: ${OFFICIAL_EDT_DOWNLOAD.communityLicenseUrl}`);
+  }
+
+  if (edt.workmate) {
+    const wm = edt.workmate;
+    if (wm.status === 'ready') {
+      lines.push(
+        `5а. 1С:Напарник (Workmate ↔ EDT MCP): АКТИВИРОВАН И ГОТОВ (ключ задан${
+          wm.bridgeSessionReady ? ', мост edt-mcp поднят' : ''
+        }${wm.askWorkmateToolEnabled === false ? '; включите ask_workmate через enable_toolset(["workmate"])' : ''})`
+      );
+    } else if (wm.status === 'no_client_token' || wm.status === 'needs_activation_and_live_check') {
+      lines.push(
+        `5а. 1С:Напарник (Workmate ↔ EDT MCP): ПЛАГИН НАЙДЕН, ТРЕБУЕТСЯ КЛЮЧ АКТИВАЦИИ — получите ключ на ${OFFICIAL_EDT_DOWNLOAD.workmateUrl}, укажите в 1С:EDT (Окно → Параметры → 1С:Напарник) и проверьте связь через get_server_status / ask_workmate`
+      );
+    } else if (wm.status === 'disabled') {
+      lines.push(
+        '5а. 1С:Напарник (Workmate ↔ EDT MCP): ВЫКЛЮЧЕН в настройках 1С:EDT — включите 1С:Напарник и укажите ключ с https://code.1c.ai/'
+      );
+    } else if (wm.status === 'configured_offline_verify_in_edt') {
+      lines.push(
+        '5а. 1С:Напарник (Workmate ↔ EDT MCP): плагин и настройки найдены на диске — откройте 1С:EDT и подтвердите живую связь через get_server_status / ask_workmate'
+      );
+    } else if (edt.edt && edt.edt.installed) {
+      lines.push(
+        `5а. 1С:Напарник (Workmate ↔ EDT MCP): НЕ УСТАНОВЛЕН в 1С:EDT — установите расширение 1С:Напарник и укажите ключ с ${OFFICIAL_EDT_DOWNLOAD.workmateUrl}`
+      );
+    }
+  }
+
+  if (report.infobases && report.infobases.total > 0) {
+    const bk = report.infobases.byKind;
+    lines.push(
+      `5б. Базы 1С в стартере (ibases.v8i): всего ${report.infobases.total} (файловых /F: ${bk.file}, автономный сервер/веб /WS: ${bk.standalone_or_web}, кластер /S: ${bk.cluster_or_direct})`
+    );
   }
 
   if (report.gitIdentity) {
@@ -2102,6 +2379,7 @@ function parseCliArgs(argv) {
     else if (arg === '--email' && args[i + 1]) flags.gitEmail = args[++i];
     else if (arg === '--target' && args[i + 1]) flags.browserTarget = args[++i];
     else if (arg === '--license') flags.browserTarget = 'license';
+    else if (arg === '--workmate') flags.browserTarget = 'workmate';
   }
   return flags;
 }
@@ -2167,6 +2445,7 @@ module.exports = {
   openUrlInSystemBrowser,
   discoverAiClients,
   discoverPlatforms,
+  discoverRegisteredInfobases,
   parseEdtIniVm,
   inspectEdtBundlesInfo,
   readEdtWorkspacePrefs,

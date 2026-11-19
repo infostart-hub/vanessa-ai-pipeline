@@ -36,7 +36,14 @@ skills; do not broaden maintenance to the workspace or unrelated projects.
    `ready`. If the deadline expires, stop and report the unsettled project; do
    not trust the clean result or continue against an unsettled/unknown state.
 2. Resolve application identity with `get_applications` and
-   `list_configurations`. For `update_database`, review the current preview and
+   `list_configurations`. Note that `get_applications` enriches autonomous
+   (standalone) server entries (`type="com.e1c.g5.dt.applications.type.wst-server"`,
+   `applicationKind="standaloneServer"`) with `webUrl`, `port`,
+   `wsConnectionString`, and `infobaseFile`; to wrap an existing `1Cv8.1CD` in an
+   EDT standalone server use `create_infobase(..., applicationKind="standaloneServer", mode="register")`.
+   For a `standaloneServer` (`wst-server`) application, prefer coordinated launch
+   (`launch` or `run_yaxunit_tests` with `updateBeforeLaunch=true`) rather than a
+   bare `update_database`. For `update_database` on file/cluster infobases, review the current preview and
    side effects with `terminateRunningClients=false`, obtain authority, execute
    once with the reviewed value, and verify the final state. Use `true` only
    when explicit application-wide authority covers every matching EDT-launched

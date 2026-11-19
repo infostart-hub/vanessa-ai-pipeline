@@ -22,7 +22,14 @@ Git, production-write, or proof route.
 
 ## Primary workflow
 
-1. Resolve the project and inspect `get_tool_guide` for `ask_workmate`.
+1. Check `get_server_status` (`workmate` block: `installed`, `enabled`,
+   `tokenConfigured`, `bridgeSessionReady`, `askWorkmateToolEnabled`, `status`).
+   If `status` is `no_client_token` or `disabled`, direct the user to obtain an
+   access key at `https://code.1c.ai/` and configure it in 1C:EDT (`Window ->
+   Preferences -> 1C:Workmate / 1С:Напарник`). If `askWorkmateToolEnabled` is
+   `false`, reveal the `workmate` toolset via `enable_toolset(["workmate"])` or
+   ask the user to enable `ask_workmate` in `Window -> Preferences -> MCP Server`.
+2. Resolve the project and inspect `get_tool_guide` for `ask_workmate`.
 2. Treat `projectName` as Workmate context, not an authorization or isolation
    boundary. For a bridge/tool-capable call that could write, require a proven
    filtered/read-only capability set or actual filesystem/process containment

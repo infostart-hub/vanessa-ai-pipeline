@@ -87,14 +87,46 @@ node "<PLUGIN_ROOT>/bin/pipeline-deploy.cjs" doctor --json
 
 ---
 
-## 5. Шаг 4 — Проверка лицензии и подключение тестовой базы КА / ЗУП / ERP
+## 4а. Шаг 3а — Обязательная активация `1С:Напарник` и проверка связи с `EDT MCP`
 
-1. **Перед первым вызовом `Vanessa Runner` на базе пользователя**:
-   - Убедись, что пользователь указал путь к **тестовой копии базы** (не боевой!) и **открывал её хотя бы 1 раз вручную в «1С:Предприятии»**, активировав лицензию (корпоративный пин-код или бесплатную комьюнити-лицензию с https://developer.1c.ru/, открыть страницу в браузере можно командой `node "<PLUGIN_ROOT>/bin/pipeline-deploy.cjs" open-edt-download --license`).
-2. **Режим 1 (напрямую по тестовой базе через Платформу 1С + `Vanessa Runner`)**:
-   - Выгрузи нужные объекты/конфигурацию или расширение через `vanessa-runner` (`cf_dump` / `validate_syntax_check`) и приступай к разбору задачи по КА (`onec-ka-incident-router`) или ЗУП (`onec-zup-payroll-diagnostics`).
-3. **Режим 2 (через 1С:EDT + `EDT MCP`)**:
-   - Открой в 1С:EDT склонированный проект конфигурации от релиз-инженера (либо для доработки типовой КА/ЗУП создай **Проект расширения конфигурации** через `Файл → Новый → Проект расширения конфигурации`), убедись через `list_projects`, что проект в статусе `READY`, и приступай к задаче.
+1. Посмотри поле `edt.workmate` из `doctor --json` (а при открытой 1С:EDT — вызови инструмент `get_server_status` в `edt-mcp` и проверь объект `workmate`):
+   - `installed`: установлен ли плагин `1С:Напарник` (`com.e1c.edt.ai`) в эту 1С:EDT;
+   - `enabled` и `tokenConfigured`: включён ли `1С:Напарник` и введён ли ключ доступа;
+   - `askWorkmateToolEnabled`: включён ли инструмент `ask_workmate` в профиле `EDT MCP`.
+2. **Если `workmate.status != "ready"` (нет плагина, он выключен или не указан ключ `tokenConfigured == false`)**:
+   - Открой страницу получения ключа в браузере пользователя:
+     ```sh
+     node "<PLUGIN_ROOT>/bin/pipeline-deploy.cjs" open-edt-download --workmate
+     ```
+   - Попроси пользователя простым языком (как при активации лицензии):
+     *«Зайдите на открывшуюся страницу https://code.1c.ai/, получите ключ доступа 1С:Напарник и вставьте его в окне 1С:EDT: Окно → Параметры → 1С:Напарник (сам ключ в чат не отправляйте). Когда сохраните настройки — напишите мне "ключ указал", я проверю связь»*.
+3. **Контрольная проверка живой связки `EDT MCP ↔ 1С:Напарник`**:
+   - Как только `get_server_status` показал `workmate.status == "ready"` и `tokenConfigured == true`:
+     1) если `askWorkmateToolEnabled == false` — вызови `enable_toolset` с `toolsets: ["workmate"]` (или попроси включить `ask_workmate` в `Окно → Параметры → MCP Server`);
+     2) выполни быструю безоператорную проверку моста без изменения проекта: вызови `ask_workmate` с `workmateTool: "JShellSession"`, `workmateArgs: "{}"`, `waitSeconds: 15` (при необходимости дождись `get_job_status`) и подтверди пользователю, что `1С:Напарник` активирован и связан с `EDT MCP`.
+
+---
+
+## 5. Шаг 4 — Лицензия и подключение тестовой базы (Файловая ИБ / Автономный сервер 1С `ibsrv` / Кластер)
+
+1. **Автоматический поиск баз и проверка ручного первого запуска**:
+   - В выводе `doctor --json` поле `infobases` уже содержит все базы пользователя из `ibases.v8i` без паролей (`kind: "file"`, `"standalone_or_web"`, `"cluster_or_direct"`), а `platforms[*].standaloneServerAvailable` показывает наличие `ibsrv` и `ibcmd`.
+   - Убедись, что выбранная база — **тестовая копия** (не боевая!) и пользователь **открывал её хотя бы 1 раз вручную в «1С:Предприятии» без окна лицензии** (при необходимости открой https://developer.1c.ru/ командой `node "<PLUGIN_ROOT>/bin/pipeline-deploy.cjs" open-edt-download --license`).
+
+2. **Если тестовая база развёрнута на Автономном сервере 1С (`ibsrv` / `ibcmd`) — поддерживаются оба промышленных варианта**:
+   - **Вариант А: Автономный сервер внутри `1С:EDT` (`wst-server`)**:
+     - Вызови `get_applications(projectName)` в `edt-mcp`: для приложений типа `com.e1c.g5.dt.applications.type.wst-server` (`applicationKind: "standaloneServer"`) инструмент сразу вернёт `webUrl`, `port`, `wsConnectionString` (`/WS"http://..."`) и `infobaseFile`.
+     - Если нужно обернуть существующую файловую базу в Автономный сервер EDT — используй `create_infobase(projectName=..., infobaseFile=..., applicationKind="standaloneServer", mode="register")`.
+     - **Важно**: для обновления БД на Автономном сервере EDT **не вызывай** голый `update_database` — используй координированный запуск `launch(projectName=..., applicationId=..., updateBeforeLaunch=true)` или `run_yaxunit_tests(..., updateBeforeLaunch=true)`.
+     - Для запуска клиента или автотестов через `Vanessa Runner` по этому же серверу передавай `ibconnection: "<wsConnectionString>"` (либо `--ibsrv --ibsrv-attach --ibsrv-port <port>`).
+   - **Вариант Б: Внешний уже запущенный Автономный сервер `ibsrv` (служба / `config.yaml` / веб-строка `ws=` в `ibases.v8i`)**:
+     - В `run_enterprise` и `test_vanessa` передавай `ibconnection` напрямую: `/WS"http://localhost:8314/..."`, `http://localhost:8314/...` или строку `ws="http://..."` из `ibases.v8i` (либо флаги `--ibsrv --ibsrv-attach --ibsrv-port <порт>` — при завершении `Vanessa Runner` **не останавливает** чужой процесс `ibsrv`).
+     - Пока процесс `ibsrv` запущен и держит монопольную блокировку `1Cv8.1CD`, не вызывай пакетный Конфигуратор (`1cv8 DESIGNER /F...`) напрямую по файлу; для офлайн-операций через `ibcmd` (`cf_load`, `cfe_load`, `infobase_update`, `cf_dump`) при остановленном `ibsrv` передавай флаг `--ibcmd` и путь к `config.yaml` автономного сервера (или каталог базы) в `ibconnection`.
+   - **Вариант В: Подъём временного `ibsrv` самим `Vanessa Runner` поверх файловой ИБ**:
+     - Передавай файловый путь `/F"..."` вместе с флагом `--ibsrv` (при необходимости `--ibsrv-debug` / `--ibsrv-direct`): раннер сам выберет свободный порт, поднимет `ibsrv`, прогонит сценарий и штатно погасит свой экземпляр сервера.
+
+3. **Старт работы по задаче**:
+   - В связке с `1С:EDT` убедись через `list_projects`, что проект в статусе `READY`, а в режиме прямой работы с ИБ используй `vanessa-runner` и предметные навыки (`onec-requirements-analysis`, `onec-ka-incident-router`, `onec-zup-payroll-diagnostics` и др.).
 
 ---
 
