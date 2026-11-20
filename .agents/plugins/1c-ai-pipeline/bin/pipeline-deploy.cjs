@@ -428,14 +428,12 @@ function configureGitIdentity(name, email, options = {}) {
   return { ok: verified.configured, ...verified };
 }
 
-function openUrlInSystemBrowser(targetKeyOrUrl = 'edt', options = {}) {
-  const resolvedUrl = ALLOWED_BROWSER_TARGETS[targetKeyOrUrl] || targetKeyOrUrl;
-  const allowedSet = new Set(Object.values(ALLOWED_BROWSER_TARGETS));
-  if (!allowedSet.has(resolvedUrl)) {
+function launchBrowserUrl(resolvedUrl, options = {}) {
+  if (!resolvedUrl || !/^https:\/\/[a-zA-Z0-9.-]+(?::\d+)?(?:\/[^\s"<>\\^`{|}]*)?$/.test(resolvedUrl)) {
     return {
       ok: false,
       url: resolvedUrl,
-      error: `URL is not in allowlist (${Array.from(allowedSet).join(', ')})`,
+      error: 'Only clean https:// URLs are permitted for browser launch',
     };
   }
   const platform = options.platform || process.platform;
@@ -464,6 +462,380 @@ function openUrlInSystemBrowser(targetKeyOrUrl = 'edt', options = {}) {
   } catch (error) {
     return { ok: false, url: resolvedUrl, error: String(error.message || error) };
   }
+}
+
+function openUrlInSystemBrowser(targetKeyOrUrl = 'edt', options = {}) {
+  const resolvedUrl = ALLOWED_BROWSER_TARGETS[targetKeyOrUrl] || targetKeyOrUrl;
+  const allowedSet = new Set(Object.values(ALLOWED_BROWSER_TARGETS));
+  if (!allowedSet.has(resolvedUrl)) {
+    return {
+      ok: false,
+      url: resolvedUrl,
+      error: `URL is not in allowlist (${Array.from(allowedSet).join(', ')})`,
+    };
+  }
+  return launchBrowserUrl(resolvedUrl, options);
+}
+
+function resolveSshToolBinary(toolBaseName, options = {}) {
+  const env = options.env || process.env;
+  const platform = options.platform || process.platform;
+  const names = platform === 'win32' ? [`${toolBaseName}.exe`] : [toolBaseName];
+  const inPath = findInPath(names, env, platform);
+  if (inPath && isFile(inPath)) return inPath;
+  if (platform === 'win32') {
+    const sysRoot = env.SystemRoot || 'C:\\Windows';
+    const pf = env.ProgramFiles || 'C:\\Program Files';
+    const pf86 = env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+    const candidates = [
+      path.join(sysRoot, 'System32', 'OpenSSH', `${toolBaseName}.exe`),
+      path.join(pf, 'Git', 'usr', 'bin', `${toolBaseName}.exe`),
+      path.join(pf86, 'Git', 'usr', 'bin', `${toolBaseName}.exe`),
+    ];
+    if (env.LOCALAPPDATA) {
+      candidates.push(path.join(env.LOCALAPPDATA, 'Programs', 'Git', 'usr', 'bin', `${toolBaseName}.exe`));
+    }
+    for (const cand of candidates) {
+      if (isFile(cand)) return cand;
+    }
+  } else {
+    for (const cand of [`/usr/bin/${toolBaseName}`, `/usr/local/bin/${toolBaseName}`, `/opt/homebrew/bin/${toolBaseName}`]) {
+      if (isFile(cand)) return cand;
+    }
+  }
+  return null;
+}
+
+function inspectSshKey(options = {}) {
+  const homedir = options.homedir !== undefined ? options.homedir : os.homedir();
+  const sshDir = options.sshDir || (homedir ? path.join(homedir, '.ssh') : null);
+  const pubNames = ['id_ed25519.pub', 'id_ecdsa.pub', 'id_rsa.pub'];
+  if (sshDir && isDir(sshDir)) {
+    for (const pubName of pubNames) {
+      const pubPath = path.join(sshDir, pubName);
+      if (!isFile(pubPath)) continue;
+      try {
+        const firstLine = fs
+          .readFileSync(pubPath, 'utf8')
+          .split(/\r?\n/)
+          .map((s) => s.trim())
+          .find((s) => /^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-\S+)\s+[A-Za-z0-9+/=]+/.test(s));
+        if (firstLine) {
+          const parts = firstLine.split(/\s+/);
+          return {
+            configured: true,
+            publicKeyPath: pubPath,
+            publicKey: firstLine,
+            keyType: parts[0] || null,
+            keyComment: parts.slice(2).join(' ') || null,
+          };
+        }
+      } catch {
+        // Ignore unreadable .pub file
+      }
+    }
+  }
+  return {
+    configured: false,
+    publicKeyPath: sshDir ? path.join(sshDir, 'id_ed25519.pub') : null,
+    publicKey: null,
+    keyType: null,
+    keyComment: null,
+  };
+}
+
+function ensureSshKey(options = {}) {
+  const existing = inspectSshKey(options);
+  if (existing.configured) {
+    return { ok: true, created: false, ...existing };
+  }
+  const homedir = options.homedir !== undefined ? options.homedir : os.homedir();
+  const sshDir = options.sshDir || (homedir ? path.join(homedir, '.ssh') : null);
+  if (!sshDir) {
+    return { ok: false, created: false, error: 'Не удалось определить домашний каталог для ~/.ssh.' };
+  }
+  fs.mkdirSync(sshDir, { recursive: true, mode: 0o700 });
+  const keyBasePath = path.join(sshDir, 'id_ed25519');
+  const comment =
+    String(options.gitEmail || '').trim() ||
+    inspectGitIdentity(options).userEmail ||
+    '1c-ai-pipeline';
+
+  if (typeof options.generateSshKeyFn === 'function') {
+    const genCustom = options.generateSshKeyFn(keyBasePath, comment);
+    if (!genCustom || genCustom.ok === false) {
+      return { ok: false, created: false, error: (genCustom && genCustom.error) || 'ssh-keygen failed' };
+    }
+  } else {
+    const keygenBin = options.sshKeygenExecutable || resolveSshToolBinary('ssh-keygen', options);
+    if (!keygenBin) {
+      return {
+        ok: false,
+        created: false,
+        error: 'Утилита ssh-keygen не найдена (установите Git for Windows или компонент OpenSSH Client).',
+      };
+    }
+    const res = spawnSync(keygenBin, ['-t', 'ed25519', '-N', '', '-C', comment, '-f', keyBasePath], {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 15000,
+      env: options.env || process.env,
+    });
+    if (res.status !== 0) {
+      return {
+        ok: false,
+        created: false,
+        error: ((res.stderr || '') + ' ' + (res.stdout || '')).trim() || `ssh-keygen exited with ${res.status}`,
+      };
+    }
+  }
+
+  const after = inspectSshKey({ ...options, sshDir });
+  return { ok: after.configured, created: after.configured, ...after };
+}
+
+function parseGitRemoteOriginInfo(rawInput) {
+  const trimmed = String(rawInput || '').trim();
+  if (!trimmed) {
+    return { ok: false, error: 'Не указан адрес корпоративного GitLab / Git-репозитория.' };
+  }
+
+  let host = null;
+  let httpsPortPart = '';
+  let sshPort = null;
+  let repoPath = null;
+
+  // 1. SCP-like SSH syntax: git@gitlab.company.ru:group/sub/project.git
+  const scpMatch = trimmed.match(/^(?:[^@\s]+@)?([a-zA-Z0-9.-]+):([A-Za-z0-9_./-]+?)(?:\.git)?\/?$/);
+  if (scpMatch && !trimmed.includes('://')) {
+    host = scpMatch[1];
+    repoPath = scpMatch[2].replace(/^\/+|\/+$/g, '');
+  } else if (/^ssh:\/\//i.test(trimmed)) {
+    try {
+      const u = new URL(trimmed);
+      host = u.hostname;
+      if (u.port) sshPort = Number(u.port);
+      const p = u.pathname.replace(/^\/+|\/+$/g, '').replace(/\.git$/i, '');
+      repoPath = p || null;
+    } catch {
+      return { ok: false, error: 'Некорректный SSH URL репозитория.' };
+    }
+  } else if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      const u = new URL(trimmed);
+      host = u.hostname;
+      if (u.port) httpsPortPart = `:${u.port}`;
+      let p = u.pathname.replace(/^\/+|\/+$/g, '');
+      // Strip GitLab UI suffixes like /-/tree/main or /-/blob/...
+      if (p.includes('/-/')) {
+        p = p.split('/-/')[0];
+      }
+      p = p.replace(/\.git$/i, '');
+      repoPath = p || null;
+    } catch {
+      return { ok: false, error: 'Некорректный HTTPS URL репозитория.' };
+    }
+  } else if (/^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:\/[A-Za-z0-9_./-]+)?$/.test(trimmed)) {
+    const slashIdx = trimmed.indexOf('/');
+    if (slashIdx === -1) {
+      host = trimmed;
+    } else {
+      host = trimmed.slice(0, slashIdx);
+      repoPath = trimmed.slice(slashIdx + 1).replace(/^\/+|\/+$/g, '').replace(/\.git$/i, '') || null;
+    }
+  } else {
+    return { ok: false, error: 'Не удалось распознать хост GitLab / GitHub из переданной строки.' };
+  }
+
+  if (!host || !/^[a-zA-Z0-9.-]+$/.test(host)) {
+    return { ok: false, error: 'Некорректное доменное имя Git-сервера.' };
+  }
+
+  const lowerHost = host.toLowerCase();
+  const isGithub = lowerHost === 'github.com';
+  const webBaseUrl = `https://${host}${httpsPortPart}`;
+  const sshKeysUrl = isGithub ? 'https://github.com/settings/keys' : `${webBaseUrl}/-/user_settings/ssh_keys`;
+  const sshKeysFallbackUrl = isGithub ? 'https://github.com/settings/keys' : `${webBaseUrl}/-/profile/keys`;
+  const repoSegments = repoPath ? repoPath.split('/').filter(Boolean) : [];
+  const repoName = repoSegments.length > 0 ? repoSegments[repoSegments.length - 1] : null;
+  const sshCloneUrl = repoPath
+    ? sshPort
+      ? `ssh://git@${host}:${sshPort}/${repoPath}.git`
+      : `git@${host}:${repoPath}.git`
+    : null;
+  const httpsCloneUrl = repoPath ? `${webBaseUrl}/${repoPath}.git` : null;
+  const webProjectUrl = repoPath ? `${webBaseUrl}/${repoPath}` : webBaseUrl;
+
+  return {
+    ok: true,
+    host,
+    provider: isGithub ? 'github' : 'gitlab',
+    webBaseUrl,
+    webProjectUrl,
+    sshKeysUrl,
+    sshKeysFallbackUrl,
+    sshPort,
+    repoPath,
+    repoName,
+    sshCloneUrl,
+    httpsCloneUrl,
+  };
+}
+
+function openGitServerSshKeysPage(repoUrlOrHost, options = {}) {
+  const parsed = parseGitRemoteOriginInfo(repoUrlOrHost);
+  if (!parsed.ok) {
+    return { ok: false, error: parsed.error };
+  }
+  const browser = launchBrowserUrl(parsed.sshKeysUrl, options);
+  return {
+    ...browser,
+    host: parsed.host,
+    sshKeysUrl: parsed.sshKeysUrl,
+    sshKeysFallbackUrl: parsed.sshKeysFallbackUrl,
+    webProjectUrl: parsed.webProjectUrl,
+  };
+}
+
+function discoverClonedEdtProjects(rootDir) {
+  const results = [];
+  if (!rootDir || !isDir(rootDir)) return results;
+  const skipNames = new Set(['.git', '.metadata', 'node_modules', 'target', 'build', 'oscript_modules']);
+
+  const walk = (dir, depth) => {
+    if (depth > 3) return;
+    const dotProject = path.join(dir, '.project');
+    if (isFile(dotProject)) {
+      try {
+        const xml = fs.readFileSync(dotProject, 'utf8');
+        const isEdt =
+          xml.includes('com.e1c.g5.dt') ||
+          isFile(path.join(dir, 'src', 'Configuration', 'Configuration.mdo')) ||
+          isFile(path.join(dir, 'Configuration', 'Configuration.mdo'));
+        if (isEdt) {
+          const nameMatch = xml.match(/<name>([^<]+)<\/name>/);
+          results.push({
+            projectName: nameMatch ? nameMatch[1].trim() : path.basename(dir),
+            projectDir: dir,
+          });
+        }
+      } catch {
+        // Ignore unreadable .project
+      }
+    }
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || skipNames.has(entry.name) || entry.name.startsWith('.')) continue;
+      walk(path.join(dir, entry.name), depth + 1);
+    }
+  };
+
+  walk(rootDir, 0);
+  return results;
+}
+
+function buildGitSshEnv(options = {}) {
+  const baseEnv = { ...(options.env || process.env), GIT_TERMINAL_PROMPT: '0' };
+  const sshBin = options.sshExecutable || resolveSshToolBinary('ssh', options);
+  const sshCmd = sshBin ? `"${sshBin.replace(/\\/g, '/')}"` : 'ssh';
+  baseEnv.GIT_SSH_COMMAND = `${sshCmd} -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20`;
+  return baseEnv;
+}
+
+function cloneProjectRepository(repoUrl, targetDir, options = {}) {
+  const remote = parseGitRemoteOriginInfo(repoUrl);
+  if (!remote.ok || !remote.repoName) {
+    return {
+      ok: false,
+      status: 'invalid_repo_url',
+      error: remote.error || 'Укажите полную ссылку на проект в GitLab (например, git@gitlab...:group/project.git или https://gitlab.../group/project).',
+    };
+  }
+
+  const sshKeyInfo = ensureSshKey(options);
+  const homedir = options.homedir !== undefined ? options.homedir : os.homedir();
+  const resolvedDest = path.resolve(targetDir || path.join(homedir || '.', 'projects', remote.repoName));
+
+  if (isDir(path.join(resolvedDest, '.git'))) {
+    const edtProjects = discoverClonedEdtProjects(resolvedDest);
+    return {
+      ok: true,
+      status: 'already_cloned',
+      targetDir: resolvedDest,
+      remote,
+      edtProjects,
+      edtActivationStepsRu:
+        `Проект уже скачан в папку ${resolvedDest}. Откройте 1С:EDT → «Файл → Импорт → 1С:Предприятие → Проекты 1С:Enterprise Development Tools в рабочую область» → выберите папку ${resolvedDest} → нажмите «Готово» и дождитесь статуса READY в EDT MCP (list_projects).`,
+    };
+  }
+
+  const gitBin = options.gitExecutable !== undefined ? options.gitExecutable : resolveGitBinary(options);
+  if (!gitBin) {
+    return { ok: false, status: 'git_missing', error: 'Git не найден на компьютере. Сначала выполните deploy.' };
+  }
+
+  const preferSsh = Boolean(options.preferSsh || /^git@|^ssh:\/\//i.test(String(repoUrl).trim()));
+  const cloneUrl = preferSsh && remote.sshCloneUrl ? remote.sshCloneUrl : String(repoUrl).trim();
+  fs.mkdirSync(path.dirname(resolvedDest), { recursive: true });
+
+  const cloneRunner =
+    options.runGitCloneFn ||
+    ((url, dest) =>
+      spawnSync(gitBin, ['clone', url, dest], {
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 600000,
+        env: buildGitSshEnv(options),
+      }));
+
+  let res = cloneRunner(cloneUrl, resolvedDest);
+  // If user pasted an HTTPS corporate GitLab URL that failed without password/token, automatically try SSH clone URL if SSH key is present!
+  if (res.status !== 0 && !preferSsh && remote.sshCloneUrl && sshKeyInfo.ok) {
+    const firstErr = `${res.stderr || ''}\n${res.stdout || ''}`;
+    if (/Authentication failed|could not read Username|terminal prompts disabled|HTTP Basic: Access denied|401|403/i.test(firstErr)) {
+      res = cloneRunner(remote.sshCloneUrl, resolvedDest);
+    }
+  }
+
+  if (res.status === 0) {
+    const edtProjects = discoverClonedEdtProjects(resolvedDest);
+    return {
+      ok: true,
+      status: 'cloned',
+      targetDir: resolvedDest,
+      cloneUrlUsed: cloneUrl,
+      remote,
+      edtProjects,
+      edtActivationStepsRu:
+        `Проект скачан в ${resolvedDest}. Чтобы активировать его в 1С:EDT: откройте 1С:EDT → «Файл → Импорт → 1С:Предприятие → Проекты 1С:Enterprise Development Tools в рабочую область» → укажите ${resolvedDest} → нажмите «Готово» и проверьте готовность через list_projects.`,
+    };
+  }
+
+  const detail = `${res.stderr || ''}\n${res.stdout || ''}`.trim();
+  let browserOpened = null;
+  if (options.openKeys) {
+    browserOpened = openGitServerSshKeysPage(repoUrl, options);
+  }
+
+  return {
+    ok: false,
+    status: 'git_auth_or_ssh_required',
+    detail,
+    targetDir: resolvedDest,
+    remote,
+    sshKey: sshKeyInfo,
+    browserOpened,
+    userActionRu: [
+      `1. Войдите в корпоративный GitLab в браузере: ${remote.sshKeysUrl} (если страница вернула 404 в старой версии GitLab — откройте ${remote.sshKeysFallbackUrl}).`,
+      `2. В поле «Key» вставьте ваш готовый публичный SSH-ключ с этого компьютера: ${sshKeyInfo.publicKey || '(выполните setup-ssh)'} и нажмите «Add key».`,
+      `3. Убедитесь, что у вашей учётной записи есть доступ к проекту ${remote.webProjectUrl}, и напишите в чат «ключ добавил» — агент сразу скачает проект (${remote.sshCloneUrl || cloneUrl}) и поможет активировать его в 1С:EDT.`,
+    ].join('\n'),
+  };
 }
 
 function discoverAiClients(options = {}) {
@@ -1538,6 +1910,7 @@ function inspectVanessaAutomation(settingsData = {}, options = {}) {
 async function runDoctor(options = {}) {
   const nodePath = inspectNodeAndPath(options);
   const gitIdentity = inspectGitIdentity(options);
+  const gitSsh = inspectSshKey(options);
   const aiClients = discoverAiClients(options);
   const platforms = discoverPlatforms(options);
   const infobases = discoverRegisteredInfobases(options);
@@ -1560,6 +1933,7 @@ async function runDoctor(options = {}) {
   return {
     nodePath,
     gitIdentity,
+    gitSsh,
     aiClients,
     platforms,
     infobases,
@@ -1577,12 +1951,15 @@ async function runDoctor(options = {}) {
     edt: edtSubsystem,
     humanChecklist: {
       gitAuthorConfigured: gitIdentity.configured,
+      gitSshKeyReady: gitSsh.configured,
       edtInstalled: Boolean(edtInfo.installed),
       workmateActivated: edtSubsystem.workmate?.status === 'ready',
       workmateActivationHintRu:
         'Получите ключ доступа 1С:Напарник на https://code.1c.ai/, укажите его в настройках 1С:EDT (Окно → Параметры → 1С:Напарник) и проверьте связь через EDT-MCP (get_server_status / ask_workmate).',
+      gitlabSshAndProjectActivationHintRu:
+        'Выполните setup-ssh (при известном адресе GitLab добавьте --open-keys <URL>), покажите пользователю готовый публичный ключ ssh-ed25519 для вставки в GitLab → SSH Keys, затем скачайте репозиторий через clone-project и помогите активировать проект в 1С:EDT (Файл → Импорт → Проекты 1С:EDT → статус READY в list_projects).',
       releaseEngineerRepoHintRu:
-        'Попросите у релиз-инженера доступ к репозиторию конфигурации 1С (КА / ЗУП / вашей базы) на вашу корпоративную почту и пришлите полученную ссылку в чат — ИИ сам скачает проект.',
+        'Попросите у релиз-инженера доступ к репозиторию конфигурации 1С (КА / ЗУП / вашей базы) в корпоративном GitLab, войдите в GitLab и добавьте публичный SSH-ключ, затем пришлите ссылку на проект в чат — ИИ сам скачает проект и поможет открыть его в 1С:EDT.',
       manualTestDbLicenseHintRu:
         'Откройте локальную тестовую копию базы или базу на Автономном сервере 1С (не боевую!) 1 раз вручную в «1С:Предприятии» и убедитесь, что она запускается без окна лицензии (при необходимости активируйте корп. пин-код или бесплатную комьюнити-лицензию с https://developer.1c.ru/).',
     },
@@ -2327,6 +2704,15 @@ function formatHumanDoctorReport(report) {
       }`
     );
   }
+  if (report.gitSsh) {
+    lines.push(
+      `6а. SSH-ключ для корпоративного GitLab / GitHub: ${
+        report.gitSsh.configured
+          ? `ГОТОВ (${report.gitSsh.keyType} в ${report.gitSsh.publicKeyPath}) — при скачивании репо покажите ключ пользователю для добавления в GitLab → SSH Keys и выполните clone-project`
+          : 'НЕ СОЗДАН — выполните setup-ssh (ключ создастся автоматически без терминала), откройте пользователю GitLab → SSH Keys (--open-keys <URL>) и скачайте проект через clone-project'
+      }`
+    );
+  }
   lines.push(`7. Файл настроек: ${report.settingsFile}`);
   if (report.onboardingModes.directDatabaseModeReady && !report.onboardingModes.edtModeReady) {
     lines.push(
@@ -2359,6 +2745,11 @@ function parseCliArgs(argv) {
     gitName: null,
     gitEmail: null,
     browserTarget: 'edt',
+    repoUrl: null,
+    destDir: null,
+    openKeys: false,
+    openKeysTarget: null,
+    preferSsh: false,
   };
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -2380,6 +2771,15 @@ function parseCliArgs(argv) {
     else if (arg === '--target' && args[i + 1]) flags.browserTarget = args[++i];
     else if (arg === '--license') flags.browserTarget = 'license';
     else if (arg === '--workmate') flags.browserTarget = 'workmate';
+    else if (arg === '--url' && args[i + 1]) flags.repoUrl = args[++i];
+    else if (arg === '--dest' && args[i + 1]) flags.destDir = args[++i];
+    else if (arg === '--prefer-ssh') flags.preferSsh = true;
+    else if (arg === '--open-keys') {
+      flags.openKeys = true;
+      if (args[i + 1] && !args[i + 1].startsWith('-')) {
+        flags.openKeysTarget = args[++i];
+      }
+    }
   }
   return flags;
 }
@@ -2414,13 +2814,34 @@ async function main(argv = process.argv.slice(2)) {
     process.stdout.write(JSON.stringify(result, null, 2) + '\n');
     return result.ok ? 0 : 2;
   }
+  if (flags.subcommand === 'setup-ssh') {
+    const keyResult = ensureSshKey(flags);
+    let browserOpened = null;
+    const keysTarget = flags.openKeysTarget || flags.repoUrl;
+    if (flags.openKeys && keysTarget) {
+      browserOpened = openGitServerSshKeysPage(keysTarget, flags);
+    }
+    const parsedTarget = keysTarget ? parseGitRemoteOriginInfo(keysTarget) : null;
+    const payload = {
+      ...keyResult,
+      remote: parsedTarget && parsedTarget.ok ? parsedTarget : null,
+      browserOpened,
+    };
+    process.stdout.write(JSON.stringify(payload, null, 2) + '\n');
+    return keyResult.ok ? 0 : 2;
+  }
+  if (flags.subcommand === 'clone-project') {
+    const result = cloneProjectRepository(flags.repoUrl, flags.destDir, flags);
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+    return result.ok ? 0 : 2;
+  }
   if (flags.subcommand === 'open-edt-download') {
     const result = openUrlInSystemBrowser(flags.browserTarget, flags);
     process.stdout.write(JSON.stringify(result, null, 2) + '\n');
     return result.ok ? 0 : 2;
   }
   process.stderr.write(
-    `Unknown subcommand: ${flags.subcommand}. Expected: doctor | deploy | deploy-edt | setup-git | open-edt-download\n`
+    `Unknown subcommand: ${flags.subcommand}. Expected: doctor | deploy | deploy-edt | setup-git | setup-ssh | clone-project | open-edt-download\n`
   );
   return 1;
 }
@@ -2442,7 +2863,16 @@ module.exports = {
   isEdtVersionSupported,
   inspectGitIdentity,
   configureGitIdentity,
+  launchBrowserUrl,
   openUrlInSystemBrowser,
+  resolveSshToolBinary,
+  inspectSshKey,
+  ensureSshKey,
+  parseGitRemoteOriginInfo,
+  openGitServerSshKeysPage,
+  discoverClonedEdtProjects,
+  buildGitSshEnv,
+  cloneProjectRepository,
   discoverAiClients,
   discoverPlatforms,
   discoverRegisteredInfobases,
